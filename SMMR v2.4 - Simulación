@@ -1,0 +1,264 @@
+/*
+ * SMMR v2.5 - SIMULADOR DE FALLAS PARA PRUEBAS DE DIAGNÓSTICO
+ * 
+ * Este programa NO necesita sensores reales (MPU6050, DHT22).
+ * Genera valores artificiales de vibración y temperatura según la falla seleccionada.
+ * 
+ * Objetivo: Verificar el algoritmo de diagnóstico y la comunicación Modbus con LabVIEW.
+ * 
+ * Cómo usarlo:
+ *   - Sube el código a un ESP32.
+ *   - Conecta el ESP32 a la misma red WiFi que LabVIEW.
+ *   - Abre el monitor serie (115200 baudios).
+ *   - Envía un carácter para cambiar la falla simulada:
+ *        '0' -> Normal (sin falla)
+ *        '1' -> Desbalance
+ *        '2' -> Desalineación
+ *        '3' -> Rodamiento / impactos
+ *        '4' -> Holgura
+ *        '5' -> Falla genérica no identificada
+ *   - El ESP32 actualizará los registros Modbus y el diagnóstico automáticamente.
+ *   - LabVIEW puede leer los registros y mostrar el estado.
+ */
+
+#include <WiFi.h>
+#include <ModbusTCP.h>
+
+// ==================== CONFIGURACIÓN DE RED ====================
+#define WIFI_SSID       "IZZI-31C2"        // Cambia por tu red
+#define WIFI_PASSWORD   "748A0DE731C2"     // Cambia por tu contraseña
+#define MODBUS_PORT     502
+
+// ==================== REGISTROS MODBUS (igual que versión anterior) ====================
+#define REG_RMS_GLOBAL      0      // float (0-1)
+#define REG_CREST_GLOBAL    2      // float (2-3)
+#define REG_TEMP            4      // float (4-5)
+#define REG_FFT_FREQ1       6      // float (6-7)
+#define REG_FFT_FREQ2       8      // float (8-9)
+#define REG_BATT_VOLTAGE   10      // float (10-11)
+#define REG_BATT_PERCENT   12      // float (12-13)
+#define REG_SYS_STATUS     14      // uint16
+#define REG_ALARM_STATUS   15      // uint16
+#define REG_FAULT_TYPE     16      // uint16
+
+#define TOTAL_HREGS        17
+
+uint16_t regs[TOTAL_HREGS];
+
+// ==================== OBJETOS MODBUS ====================
+ModbusTCP mb;
+
+// ==================== VARIABLES COMPARTIDAS ====================
+volatile float mb_rmsGlobal;
+volatile float mb_crestGlobal;
+volatile float mb_temp;
+volatile float mb_fftFreq1, mb_fftFreq2;
+volatile float mb_battVoltage, mb_battPercent;
+volatile uint16_t mb_sysStatus;
+volatile uint16_t mb_alarmStatus;
+volatile uint16_t mb_faultType;
+
+// ==================== PARÁMETROS DE DIAGNÓSTICO (ajustables) ====================
+#define MACHINE_RPM         3600.0          // RPM nominal (cambiar según tu máquina)
+#define FUNDAMENTAL_FREQ    (MACHINE_RPM/60.0)  // 60 Hz
+#define FREQ_TOLERANCE      0.8             // Hz, para comparar frecuencias
+#define CREST_IMPACT_TH     5.0             // Umbral de Crest Factor para detectar impactos
+
+#define VEL_RMS_WARNING     4.5             // mm/s (ISO 10816-3 clase II)
+#define VEL_RMS_DANGER      11.0
+#define TEMP_WARNING        60.0            // °C
+#define TEMP_DANGER         80.0
+
+// ==================== VARIABLES DE SIMULACIÓN ====================
+char faultMode = '0';   // Modo actual: '0'=normal, '1'=desbalance, '2'=desalineación, '3'=rodamiento, '4'=holgura, '5'=genérica
+
+// --- Valores para cada falla (puedes modificarlos según tu criterio) ---
+// Estructura: { RMS_mms, Crest, Temp_C, Frec1_Hz, Frec2_Hz }
+struct Falla {
+  float rms;
+  float crest;
+  float temp;
+  float freq1;
+  float freq2;
+};
+
+Falla fallas[] = {
+  { 0.5,   1.5, 25.0,  0.0,   0.0   }, // 0: Normal (sin vibración)
+  { 5.5,   3.0, 28.0, 60.0,   0.0   }, // 1: Desbalance (1x RPM)
+  { 5.0,   3.0, 30.0, 120.0,  0.0   }, // 2: Desalineación (2x RPM)
+  { 6.0,   6.5, 65.0, 180.0, 210.0 }, // 3: Rodamiento/fricción (Crest alto, frecuencias no armónicas)
+  { 5.5,   3.5, 32.0, 60.0, 120.0 }, // 4: Holgura (1x y 2x)
+  { 4.0,   4.0, 35.0, 45.0,   0.0   }  // 5: Falla genérica (no coincide con patrones)
+};
+
+// ==================== FUNCIÓN DE DIAGNÓSTICO ====================
+uint16_t diagnoseFault(float freq1, float crest, float rms_mms) {
+  if (rms_mms < 0.5) return 0;   // Sin vibración
+
+  // Desbalance: 1x RPM y Crest bajo
+  if (fabs(freq1 - FUNDAMENTAL_FREQ) < FREQ_TOLERANCE && crest < CREST_IMPACT_TH)
+    return 1;
+
+  // Desalineación: 2x RPM y Crest bajo
+  if (fabs(freq1 - 2*FUNDAMENTAL_FREQ) < FREQ_TOLERANCE && crest < CREST_IMPACT_TH)
+    return 2;
+
+  // Holgura: 1x y 2x presentes
+  if (fabs(freq1 - FUNDAMENTAL_FREQ) < FREQ_TOLERANCE &&
+      fabs(mb_fftFreq2 - 2*FUNDAMENTAL_FREQ) < FREQ_TOLERANCE &&
+      crest < CREST_IMPACT_TH)
+    return 4;
+
+  // Rodamiento o impacto: Crest alto
+  if (crest > CREST_IMPACT_TH)
+    return 3;
+
+  // Otra falla no clasificada
+  return 5;
+}
+
+uint16_t evaluateAlarmStatus(float velRMS_mms, float temp) {
+  if (velRMS_mms >= VEL_RMS_DANGER || temp >= TEMP_DANGER) return 2;
+  if (velRMS_mms >= VEL_RMS_WARNING || temp >= TEMP_WARNING) return 1;
+  return 0;
+}
+
+// ==================== FUNCIONES MODBUS ====================
+void writeFloatToHregs(uint16_t startReg, float value) {
+  uint8_t *bytes = (uint8_t*)&value;
+  uint16_t highReg = (bytes[3] << 8) | bytes[2];
+  uint16_t lowReg  = (bytes[1] << 8) | bytes[0];
+  mb.Hreg(startReg, highReg);
+  mb.Hreg(startReg + 1, lowReg);
+}
+
+// ==================== TAREA MODBUS EN CORE 1 ====================
+void modbusTCPTask(void *parameter) {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi conectado, IP: " + WiFi.localIP().toString());
+
+  mb.server();
+  for (int i = 0; i < TOTAL_HREGS; i++) {
+    mb.addHreg(i, 0);
+  }
+
+  while (1) {
+    writeFloatToHregs(REG_RMS_GLOBAL, mb_rmsGlobal);
+    writeFloatToHregs(REG_CREST_GLOBAL, mb_crestGlobal);
+    writeFloatToHregs(REG_TEMP, mb_temp);
+    writeFloatToHregs(REG_FFT_FREQ1, mb_fftFreq1);
+    writeFloatToHregs(REG_FFT_FREQ2, mb_fftFreq2);
+    writeFloatToHregs(REG_BATT_VOLTAGE, mb_battVoltage);
+    writeFloatToHregs(REG_BATT_PERCENT, mb_battPercent);
+    mb.Hreg(REG_SYS_STATUS, mb_sysStatus);
+    mb.Hreg(REG_ALARM_STATUS, mb_alarmStatus);
+    mb.Hreg(REG_FAULT_TYPE, mb_faultType);
+
+    mb.task();
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Simulador de fallas SMMR v2.5");
+  Serial.println("Comandos disponibles:");
+  Serial.println("  '0' -> Normal");
+  Serial.println("  '1' -> Desbalance");
+  Serial.println("  '2' -> Desalineación");
+  Serial.println("  '3' -> Rodamiento / impactos");
+  Serial.println("  '4' -> Holgura");
+  Serial.println("  '5' -> Falla genérica");
+  Serial.println("Envíe el carácter correspondiente por el monitor serie.");
+
+  // Inicializar valores por defecto
+  mb_battVoltage = 8.2;
+  mb_battPercent = 95.0;
+  mb_sysStatus = (1<<2);  // bit2 = encendido (WiFi se pondrá true cuando conecte)
+
+  // Crear tarea Modbus en core 1
+  xTaskCreatePinnedToCore(modbusTCPTask, "ModbusTCP", 8192, NULL, 1, NULL, 1);
+}
+
+// ==================== LOOP PRINCIPAL ====================
+void loop() {
+  // Leer comando desde el monitor serie
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c >= '0' && c <= '5') {
+      faultMode = c;
+      int idx = c - '0';
+      Serial.print("Modo cambiado a: ");
+      switch(idx) {
+        case 0: Serial.println("NORMAL"); break;
+        case 1: Serial.println("DESBALANCE"); break;
+        case 2: Serial.println("DESALINEACIÓN"); break;
+        case 3: Serial.println("RODAMIENTO / IMPACTOS"); break;
+        case 4: Serial.println("HOLGURA"); break;
+        case 5: Serial.println("FALLA GENÉRICA"); break;
+      }
+      // Mostrar los valores que se inyectarán
+      Serial.print("  RMS = "); Serial.print(fallas[idx].rms); Serial.println(" mm/s");
+      Serial.print("  Crest = "); Serial.println(fallas[idx].crest);
+      Serial.print("  Temperatura = "); Serial.print(fallas[idx].temp); Serial.println(" °C");
+      Serial.print("  Frecuencia1 = "); Serial.print(fallas[idx].freq1); Serial.println(" Hz");
+      Serial.print("  Frecuencia2 = "); Serial.print(fallas[idx].freq2); Serial.println(" Hz");
+    }
+  }
+
+  // Obtener los valores simulados según el modo actual
+  int idx = faultMode - '0';
+  float rms = fallas[idx].rms;
+  float crest = fallas[idx].crest;
+  float temp = fallas[idx].temp;
+  float f1 = fallas[idx].freq1;
+  float f2 = fallas[idx].freq2;
+
+  // Actualizar variables compartidas
+  mb_rmsGlobal = rms;
+  mb_crestGlobal = crest;
+  mb_temp = temp;
+  mb_fftFreq1 = f1;
+  mb_fftFreq2 = f2;
+
+  // Calcular diagnóstico
+  mb_faultType = diagnoseFault(f1, crest, rms);
+  mb_alarmStatus = evaluateAlarmStatus(rms, temp);
+
+  // Actualizar estado del sistema (WiFi conectado manualmente, supondremos que sí)
+  mb_sysStatus = (1<<2);  // bit2 siempre encendido
+  if (WiFi.status() == WL_CONNECTED) mb_sysStatus |= 1; // bit0 WiFi conectado
+
+  // Imprimir por serial cada 2 segundos (para depuración)
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 2000) {
+    Serial.print("=== DIAGNÓSTICO ACTUAL ===\n");
+    Serial.print("Falla: ");
+    switch(mb_faultType) {
+      case 0: Serial.print("NORMAL"); break;
+      case 1: Serial.print("DESBALANCE"); break;
+      case 2: Serial.print("DESALINEACIÓN"); break;
+      case 3: Serial.print("RODAMIENTO"); break;
+      case 4: Serial.print("HOLGURA"); break;
+      case 5: Serial.print("NO IDENTIFICADA"); break;
+    }
+    Serial.print(" | Alarma: ");
+    switch(mb_alarmStatus) {
+      case 0: Serial.print("NORMAL"); break;
+      case 1: Serial.print("ADVERTENCIA"); break;
+      case 2: Serial.print("PELIGRO"); break;
+    }
+    Serial.print(" | RMS="); Serial.print(rms,1);
+    Serial.print(" mm/s | Crest="); Serial.print(crest,1);
+    Serial.print(" | Temp="); Serial.print(temp,0);
+    Serial.println("°C");
+    lastPrint = millis();
+  }
+
+  delay(100); // Pequeña pausa para no saturar el serial
+}
