@@ -1,0 +1,424 @@
+/*
+ * SMMR v2.5 - Sistema de Monitoreo de Máquinas Rotativas
+ * Diagnóstico completo integrado (desbalance, desalineación, rodamiento, holgura)
+ * Envía a LabVIEW: severidad (0=normal,1=advertencia,2=peligro) + tipo de falla (0..5)
+ */
+
+// ==================== LIBRERIAS ====================
+#include <Wire.h>
+#include <MPU6050.h>
+#include <DHT.h>
+#include <arduinoFFT.h>
+#include <WiFi.h>
+#include <ModbusTCP.h>
+
+// ==================== CONFIGURACIÓN DE PINES Y ANÁLISIS DE VIBRACIÓN ====================
+#define PIN_DHT           32
+#define DHTTYPE           DHT22
+#define PIN_BATTERY       33
+#define SAMPLES           64
+#define SAMPLING_FREQ     120.0         // 120 Hz (para 3600 RPM)
+#define BUFFER_SIZE       120           // 1 segundo a 120 Hz
+
+#define SAMPLING_INTERVAL_MS (1000 / SAMPLING_FREQ)
+#define DELTA_TIME_SEC       (1.0 / SAMPLING_FREQ)
+
+// === Batería ===
+#define BATT_DIVIDER_FACTOR 2.0   // Con AMS1117
+#define BATT_MAX_VOLTAGE    8.4
+#define BATT_MIN_VOLTAGE    6.0
+#define BATT_READ_INTERVAL  5000
+
+// === Umbrales de severidad (ISO 10816-3, clase II) ===
+#define TEMP_WARNING  60.0   // °C
+#define TEMP_DANGER   80.0
+#define VEL_RMS_WARNING  4.5 // mm/s
+#define VEL_RMS_DANGER  11.0
+
+// === Parámetros de la máquina ===
+#define MACHINE_RPM     3600.0       // RPM nominal (ajústalo a tu máquina)
+#define FUNDAMENTAL_FREQ (MACHINE_RPM / 60.0) // Hz (en este caso 60 Hz)
+#define FREQ_TOLERANCE   0.8         // Hz (tolerancia para coincidencia de frecuencias)
+#define CREST_IMPACT_TH  5.0         // Crest Factor > 5 indica impactos (rodamiento)
+
+// === WiFi Modbus ===
+#define WIFI_SSID       "IZZI-31C2"
+#define WIFI_PASSWORD   "748A0DE731C2"
+#define MODBUS_PORT     502
+
+// === Registros Modbus (solo esenciales + diagnóstico) ===
+#define REG_RMS_GLOBAL      0
+#define REG_CREST_GLOBAL    2
+#define REG_TEMP            4
+#define REG_FFT_FREQ1       6
+#define REG_FFT_FREQ2       8
+#define REG_BATT_VOLTAGE   10
+#define REG_BATT_PERCENT   12
+#define REG_SYS_STATUS     14      // bits: 0=wifi, 2=powerOn
+#define REG_ALARM_STATUS   15      // 0=normal, 1=advertencia, 2=peligro
+#define REG_FAULT_TYPE     16      // NUEVO: código de falla (0..5)
+
+#define TOTAL_HREGS        17
+
+uint16_t regs[TOTAL_HREGS];
+
+// ==================== OBJETOS ====================
+MPU6050 mpu;
+DHT dht(PIN_DHT, DHTTYPE);
+ModbusTCP mb;
+
+float vReal[SAMPLES];
+float vImag[SAMPLES];
+ArduinoFFT<float> FFT = ArduinoFFT<float>(vReal, vImag, SAMPLES, SAMPLING_FREQ);
+
+// ==================== VARIABLES COMPARTIDAS ====================
+volatile float mb_rmsGlobal;
+volatile float mb_crestGlobal;
+volatile float mb_temp;
+volatile float mb_fftFreq1, mb_fftFreq2;
+volatile float mb_battVoltage, mb_battPercent;
+volatile uint16_t mb_sysStatus;
+volatile uint16_t mb_alarmStatus;
+volatile uint16_t mb_faultType;   // NUEVO: 0=normal, 1=desbalance, 2=desalineación, 3=rodamiento, 4=holgura, 5=no identificado
+
+// ==================== VARIABLES DEL SISTEMA (sin cambios) ====================
+int16_t ax, ay, az;
+float accelX_ms2, accelY_ms2, accelZ_ms2;
+float accelX_filt, accelY_filt, accelZ_filt;
+float velocityX=0, velocityY=0, velocityZ=0;
+float positionX=0, positionY=0, positionZ=0;
+float prevAccelX=0, prevAccelY=0, prevAccelZ=0;
+float prevVelocityX=0, prevVelocityY=0, prevVelocityZ=0;
+
+float dcStateX=0, dcStateY=0, dcStateZ=0;
+float dcOutputX=0, dcOutputY=0, dcOutputZ=0;
+const float DC_ALPHA = 0.995;
+
+float accelBufferX[BUFFER_SIZE], accelBufferY[BUFFER_SIZE], accelBufferZ[BUFFER_SIZE];
+float velBufferX[BUFFER_SIZE], velBufferY[BUFFER_SIZE], velBufferZ[BUFFER_SIZE];
+int bufferIndex = 0, bufferCount = 0;
+float peakAccelX=0, peakAccelY=0, peakAccelZ=0;
+
+int sampleIndex = 0;
+bool fftReady = false;
+
+float currentTemp = 0;
+unsigned long lastTempRead = 0;
+bool tempValid = false;
+
+float batteryVoltage = 0, batteryPercent = 0;
+unsigned long lastBattRead = 0, prevTimeMicros = 0;
+bool wifiConnected = false;
+
+// ==================== FUNCIONES AUXILIARES (sin cambios) ====================
+float applyDCBlocker(float input, float &state, float &output, float alpha) {
+  float newOutput = input - state + alpha * output;
+  state = input;
+  output = newOutput;
+  return output;
+}
+
+void updateBuffers(float ax, float ay, float az, float vx, float vy, float vz) {
+  accelBufferX[bufferIndex] = fabs(ax);
+  accelBufferY[bufferIndex] = fabs(ay);
+  accelBufferZ[bufferIndex] = fabs(az);
+  velBufferX[bufferIndex]   = fabs(vx);
+  velBufferY[bufferIndex]   = fabs(vy);
+  velBufferZ[bufferIndex]   = fabs(vz);
+
+  if (fabs(ax) > peakAccelX) peakAccelX = fabs(ax);
+  if (fabs(ay) > peakAccelY) peakAccelY = fabs(ay);
+  if (fabs(az) > peakAccelZ) peakAccelZ = fabs(az);
+
+  bufferIndex++;
+  bufferCount++;
+  if (bufferIndex >= BUFFER_SIZE) bufferIndex = 0;
+}
+
+float calculateRMS(float *buffer, int count) {
+  if (count == 0) return 0;
+  float sum = 0;
+  for (int i=0; i<count; i++) sum += buffer[i]*buffer[i];
+  return sqrt(sum/count);
+}
+
+float calculateCrestFactor(float rms, float peak) {
+  if (rms < 1e-6) return 1.0;
+  return peak / rms;
+}
+
+void resetBuffers() {
+  for (int i=0; i<BUFFER_SIZE; i++) {
+    accelBufferX[i]=accelBufferY[i]=accelBufferZ[i]=0;
+    velBufferX[i]=velBufferY[i]=velBufferZ[i]=0;
+  }
+  bufferIndex = 0;
+  bufferCount = 0;
+  peakAccelX = peakAccelY = peakAccelZ = 0;
+}
+
+void performFFT() {
+  for (int i=0; i<SAMPLES; i++) {
+    float window = 0.5 * (1 - cos(2 * PI * i / (SAMPLES - 1)));
+    vReal[i] *= window;
+  }
+  FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  FFT.compute(FFT_FORWARD);
+  FFT.complexToMagnitude();
+
+  float maxMag = 0, secondMag = 0;
+  int maxBin = 0, secondBin = 0;
+  for (int i = 1; i < SAMPLES/2; i++) {
+    if (vReal[i] > maxMag) {
+      secondMag = maxMag; secondBin = maxBin;
+      maxMag = vReal[i]; maxBin = i;
+    } else if (vReal[i] > secondMag) {
+      secondMag = vReal[i]; secondBin = i;
+    }
+  }
+  float freqResolution = SAMPLING_FREQ / SAMPLES;
+  mb_fftFreq1 = maxBin * freqResolution;
+  mb_fftFreq2 = secondBin * freqResolution;
+}
+
+void readBattery() {
+  const int numReadings = 10;
+  uint32_t adcSum = 0;
+  for (int i=0; i<numReadings; i++) {
+    adcSum += analogRead(PIN_BATTERY);
+    delay(1);
+  }
+  float adcAvg = adcSum / (float)numReadings;
+  float pinVoltage = (adcAvg / 4095.0) * 3.3;
+  float rawVoltage = pinVoltage * BATT_DIVIDER_FACTOR;
+  if (rawVoltage > 8.8) rawVoltage = 8.4;
+  if (rawVoltage < 0) rawVoltage = 0;
+  batteryVoltage = rawVoltage;
+
+  if (batteryVoltage >= BATT_MAX_VOLTAGE) {
+    batteryPercent = 100.0;
+  } else if (batteryVoltage <= BATT_MIN_VOLTAGE) {
+    batteryPercent = 0.0;
+  } else {
+    batteryPercent = (batteryVoltage - BATT_MIN_VOLTAGE) / (BATT_MAX_VOLTAGE - BATT_MIN_VOLTAGE) * 100.0;
+  }
+}
+
+void writeFloatToHregs(uint16_t startReg, float value) {
+  uint8_t *bytes = (uint8_t*)&value;
+  uint16_t highReg = (bytes[3] << 8) | bytes[2];
+  uint16_t lowReg  = (bytes[1] << 8) | bytes[0];
+  mb.Hreg(startReg, highReg);
+  mb.Hreg(startReg + 1, lowReg);
+}
+
+uint16_t evaluateAlarmStatus(float velRMS_mms, float temp) {
+  if (velRMS_mms >= VEL_RMS_DANGER || temp >= TEMP_DANGER) return 2;
+  if (velRMS_mms >= VEL_RMS_WARNING || temp >= TEMP_WARNING) return 1;
+  return 0;
+}
+
+// ==================== NUEVA FUNCIÓN: Diagnóstico de falla ====================
+uint16_t diagnoseFault(float freq1, float crest, float rms_mms) {
+  // Si no hay vibración significativa, todo normal
+  if (rms_mms < 0.5) return 0;
+
+  // Verificar si la frecuencia dominante corresponde al desbalance (1x RPM)
+  bool isUnbalance = (fabs(freq1 - FUNDAMENTAL_FREQ) < FREQ_TOLERANCE) && (crest < CREST_IMPACT_TH);
+  if (isUnbalance) return 1;  // desbalance
+
+  // Verificar si es desalineación (2x RPM)
+  bool isMisalignment = (fabs(freq1 - 2*FUNDAMENTAL_FREQ) < FREQ_TOLERANCE) && (crest < CREST_IMPACT_TH);
+  if (isMisalignment) return 2;  // desalineación
+
+  // Verificar si es holgura (frecuencia fundamental y armónicos, pero crest normal)
+  // Se asume que mb_fftFreq2 podría ser 2x o 3x
+  bool isLooseness = (fabs(freq1 - FUNDAMENTAL_FREQ) < FREQ_TOLERANCE) &&
+                     (fabs(mb_fftFreq2 - 2*FUNDAMENTAL_FREQ) < FREQ_TOLERANCE) &&
+                     (crest < CREST_IMPACT_TH);
+  if (isLooseness) return 4;  // holgura
+
+  // Si el Crest Factor es alto, probablemente rodamiento o fricción
+  if (crest > CREST_IMPACT_TH) return 3;  // rodamiento o impacto
+
+  // Si ninguna de las anteriores, falla no identificada pero hay vibración
+  return 5;
+}
+
+// ==================== TAREA MODBUS EN CORE 1 ====================
+void modbusTCPTask(void *parameter) {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  wifiConnected = true;
+  Serial.println("\nWiFi conectado, IP: " + WiFi.localIP().toString());
+
+  mb.server();
+  for (int i = 0; i < TOTAL_HREGS; i++) {
+    mb.addHreg(i, 0);
+  }
+
+  while (1) {
+    writeFloatToHregs(REG_RMS_GLOBAL, mb_rmsGlobal);
+    writeFloatToHregs(REG_CREST_GLOBAL, mb_crestGlobal);
+    writeFloatToHregs(REG_TEMP, mb_temp);
+    writeFloatToHregs(REG_FFT_FREQ1, mb_fftFreq1);
+    writeFloatToHregs(REG_FFT_FREQ2, mb_fftFreq2);
+    writeFloatToHregs(REG_BATT_VOLTAGE, mb_battVoltage);
+    writeFloatToHregs(REG_BATT_PERCENT, mb_battPercent);
+    mb.Hreg(REG_SYS_STATUS, mb_sysStatus);
+    mb.Hreg(REG_ALARM_STATUS, mb_alarmStatus);
+    mb.Hreg(REG_FAULT_TYPE, mb_faultType);   // NUEVO
+
+    mb.task();
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_BATTERY, ADC_11db);
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("ERROR: MPU6050 no conectado");
+    while(1) delay(100);
+  }
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_8);
+  dht.begin();
+  Serial.println("DHT22 inicializado");
+  resetBuffers();
+  xTaskCreatePinnedToCore(modbusTCPTask, "ModbusTCP", 16384, NULL, 1, NULL, 1);
+  Serial.println("SMMR v2.5 - 120Hz - Diagnóstico completo activo (desbalance, desalineación, etc.)");
+  prevTimeMicros = micros();
+  lastBattRead = millis();
+}
+
+// ==================== LOOP PRINCIPAL ====================
+void loop() {
+  unsigned long currentTime = millis();
+
+  if (currentTime - lastBattRead >= BATT_READ_INTERVAL) {
+    readBattery();
+    lastBattRead = currentTime;
+    mb_battVoltage = batteryVoltage;
+    mb_battPercent = batteryPercent;
+    Serial.print("Batería: ");
+    Serial.print(batteryVoltage, 2);
+    Serial.print("V (");
+    Serial.print(batteryPercent, 1);
+    Serial.println("%)");
+  }
+
+  static unsigned long prevMicros = 0;
+  unsigned long nowMicros = micros();
+  if (nowMicros - prevMicros >= (unsigned long)(1000000 / SAMPLING_FREQ)) {
+    prevMicros = nowMicros;
+
+    mpu.getMotion6(&ax, &ay, &az, NULL, NULL, NULL);
+    accelX_ms2 = (ax / 4096.0) * 9.81;
+    accelY_ms2 = (ay / 4096.0) * 9.81;
+    accelZ_ms2 = (az / 4096.0) * 9.81;
+
+    accelX_filt = applyDCBlocker(accelX_ms2, dcStateX, dcOutputX, DC_ALPHA);
+    accelY_filt = applyDCBlocker(accelY_ms2, dcStateY, dcOutputY, DC_ALPHA);
+    accelZ_filt = applyDCBlocker(accelZ_ms2, dcStateZ, dcOutputZ, DC_ALPHA);
+
+    float dt = DELTA_TIME_SEC;
+    velocityX += (prevAccelX + accelX_filt) * 0.5 * dt;
+    velocityY += (prevAccelY + accelY_filt) * 0.5 * dt;
+    velocityZ += (prevAccelZ + accelZ_filt) * 0.5 * dt;
+    prevAccelX = accelX_filt;
+    prevAccelY = accelY_filt;
+    prevAccelZ = accelZ_filt;
+
+    positionX += (prevVelocityX + velocityX) * 0.5 * dt;
+    positionY += (prevVelocityY + velocityY) * 0.5 * dt;
+    positionZ += (prevVelocityZ + velocityZ) * 0.5 * dt;
+    prevVelocityX = velocityX;
+    prevVelocityY = velocityY;
+    prevVelocityZ = velocityZ;
+
+    if (fabs(velocityX) > 10.0) velocityX = 0;
+    if (fabs(velocityY) > 10.0) velocityY = 0;
+    if (fabs(velocityZ) > 10.0) velocityZ = 0;
+    if (fabs(positionX) > 1.0) positionX = 0;
+    if (fabs(positionY) > 1.0) positionY = 0;
+    if (fabs(positionZ) > 1.0) positionZ = 0;
+
+    updateBuffers(accelX_filt, accelY_filt, accelZ_filt,
+                  velocityX, velocityY, velocityZ);
+
+    vReal[sampleIndex] = accelX_filt;
+    vImag[sampleIndex] = 0;
+    sampleIndex++;
+    if (sampleIndex >= SAMPLES) {
+      sampleIndex = 0;
+      fftReady = true;
+    }
+
+    if (currentTime - lastTempRead >= 2000) {
+      float temp = dht.readTemperature();
+      if (!isnan(temp)) {
+        currentTemp = temp;
+        mb_temp = currentTemp;
+        tempValid = true;
+      } else {
+        Serial.println("Error DHT22");
+      }
+      lastTempRead = currentTime;
+    }
+
+    static unsigned long lastAnalysis = 0;
+    if (currentTime - lastAnalysis >= 1000 && bufferCount >= BUFFER_SIZE/2) {
+      float rmsVelX = calculateRMS(velBufferX, bufferCount);
+      float rmsVelY = calculateRMS(velBufferY, bufferCount);
+      float rmsVelZ = calculateRMS(velBufferZ, bufferCount);
+      float rmsVelGlobal = sqrt(rmsVelX*rmsVelX + rmsVelY*rmsVelY + rmsVelZ*rmsVelZ);
+      float velRMS_mms = rmsVelGlobal * 1000.0;
+
+      float rmsAccX = calculateRMS(accelBufferX, bufferCount);
+      float rmsAccY = calculateRMS(accelBufferY, bufferCount);
+      float rmsAccZ = calculateRMS(accelBufferZ, bufferCount);
+      float crestX = calculateCrestFactor(rmsAccX, peakAccelX);
+      float crestY = calculateCrestFactor(rmsAccY, peakAccelY);
+      float crestZ = calculateCrestFactor(rmsAccZ, peakAccelZ);
+      float crestGlobal = max(crestX, max(crestY, crestZ));
+
+      if (fftReady) {
+        performFFT();
+        fftReady = false;
+      } else {
+        mb_fftFreq1 = 0;
+        mb_fftFreq2 = 0;
+      }
+
+      mb_rmsGlobal = velRMS_mms;
+      mb_crestGlobal = crestGlobal;
+      mb_sysStatus = (wifiConnected ? 1 : 0) | (1<<2);
+      mb_alarmStatus = evaluateAlarmStatus(velRMS_mms, currentTemp);
+
+      // DIAGNÓSTICO DE FALLA (NUEVO)
+      mb_faultType = diagnoseFault(mb_fftFreq1, crestGlobal, velRMS_mms);
+
+      // Salida CSV ampliada con el tipo de falla
+      Serial.print(millis()); Serial.print(",");
+      Serial.print(velRMS_mms,2); Serial.print(",");
+      Serial.print(crestGlobal,2); Serial.print(",");
+      Serial.print(currentTemp,1); Serial.print(",");
+      Serial.print(mb_fftFreq1,1); Serial.print(",");
+      Serial.print(mb_fftFreq2,1); Serial.print(",");
+      Serial.print(batteryVoltage,2); Serial.print(",");
+      Serial.print(batteryPercent,1); Serial.print(",");
+      Serial.print(mb_alarmStatus); Serial.print(",");
+      Serial.println(mb_faultType);
+
+      resetBuffers();
+      lastAnalysis = currentTime;
+    }
+  }
+}
