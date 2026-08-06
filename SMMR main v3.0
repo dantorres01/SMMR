@@ -1,0 +1,1294 @@
+/* SMMR v3.0 */
+
+/* --- Librerias --- */
+#include <stdio.h>
+#include <math.h>
+#include "esp_dsp.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_timer.h"
+#include "esp_err.h"
+
+#include "bmi160.h"
+
+#include <stdbool.h>
+
+#include "smmr_types.h"
+
+/* --- Instancias --- */
+
+#define SAMPLE_RATE_HZ 100
+#define SAMPLE_PERIOD_MS 10
+
+#define ACC_SCALE_2G 16384.0f
+#define G 9.80665f
+
+//static float vx = 0, vy = 0, vz = 0;
+//static float ax_prev = 0, ay_prev = 0, az_prev = 0;
+
+typedef struct 
+{
+    /* Aceleración */
+    float ax, ay, az;
+
+    /* Velocidad */
+    //float vx, vy, vz;
+
+    /* Tiempo entre muestras */
+    float dt;
+
+    /* Timestamp absoluto */
+    uint64_t timestamp;
+} imu_state_t;
+
+/* Buffers circulares */
+#define WINDOW_SIZE 1024
+
+static imu_state_t buffer_a[WINDOW_SIZE];
+static imu_state_t buffer_b[WINDOW_SIZE];
+
+static imu_state_t *fill_buffer = buffer_a;
+static imu_state_t *process_buffer = buffer_b;
+
+static uint16_t head = 0;
+static bool proceesing_busy = false;
+static bool processing_request = false;
+static bool processing_finished = false;
+
+/* Variables de calibración */
+static float offset_x = 0.0f;
+static float offset_y = 0.0f;
+static float offset_z = 0.0f;
+
+static float fx = 0;
+static float fy = 0;
+static float fz = 0;
+
+/* Variables de configuración de máquina (RPM) */
+static float machine_rpm = 0.0f;
+static float shaft_frequency = 0.0f;
+
+/* Funciones de preprocesamiento */
+static void calculate_offset(void);
+static void remove_offset(imu_state_t *imu);
+static void remove_gravity(imu_state_t *imu);
+static void low_pass_filter(imu_state_t *imu);
+
+/* Cargar datos de máquina */
+static void load_machine_configuration(void);
+
+/* Funciones de procesamiento */
+static void calculate_rms(void);
+static void calculate_peak(void);
+static void calculate_crest_factor(void);
+static void calculate_hann_window(void);
+static void calculate_fft(void);
+static void process_fft_axis(
+    float *input,
+    float *fft_buffer,
+    float *fft_mag,
+    float *peak_freq,
+    float *peak_amp);
+
+static void find_fft_peaks(
+    float *fft_mag,
+    float *peak_freq,
+    float *peak_amp);
+
+static void calculate_kurtosis(void);
+
+/* Variables de procesamiento */
+static float rms_x = 0.0f;
+static float rms_y = 0.0f;
+static float rms_z = 0.0f;
+
+static float peak_x = 0.0f;
+static float peak_y = 0.0f;
+static float peak_z = 0.0f;
+
+static float crest_x = 0.0f;
+static float crest_y = 0.0f;
+static float crest_z = 0.0f;
+
+#define FFT_SIZE WINDOW_SIZE
+
+static float fft_window[FFT_SIZE];
+
+static float fft_buffer_x[2 * FFT_SIZE];
+static float fft_buffer_y[2 * FFT_SIZE];
+static float fft_buffer_z[2 * FFT_SIZE];
+
+static float fft_mag_x[FFT_SIZE / 2];
+static float fft_mag_y[FFT_SIZE / 2];
+static float fft_mag_z[FFT_SIZE / 2];
+
+#define FFT_TOP_PEAKS 3
+#define MIN_PEAK_DISTANCE 5
+
+static float fft_peak_freq_x[FFT_TOP_PEAKS];
+static float fft_peak_amp_x[FFT_TOP_PEAKS];
+
+static float fft_peak_freq_y[FFT_TOP_PEAKS];
+static float fft_peak_amp_y[FFT_TOP_PEAKS];
+
+static float fft_peak_freq_z[FFT_TOP_PEAKS];
+static float fft_peak_amp_z[FFT_TOP_PEAKS];
+
+static float kurtosis_x = 0.0f;
+static float kurtosis_y = 0.0f;
+static float kurtosis_z = 0.0f;
+
+/* Control enum de la maquina de estados*/
+typedef enum
+{
+    DSP_IDLE = 0,
+    DSP_PREPARE,
+    DSP_RMS,
+    DSP_PEAK,
+    DSP_CRESTFACTOR,
+    DSP_KURTOSIS,
+    DSP_FFT,
+    DSP_DIAGNOSIS,
+    DSP_FINISH
+} dsp_state_t;
+
+static dsp_state_t dsp_state = DSP_IDLE;
+
+typedef struct 
+{
+    uint64_t timestamp;
+
+    float rms[3];
+
+    float peak[3];
+
+    float crest[3];
+
+    float kurtosis[3];
+
+    float fft_freq[3][FFT_TOP_PEAKS];
+    float fft_amp[3][FFT_TOP_PEAKS];
+
+    float dominant_freq;
+    float dominant_amp;
+    float dominant_order;
+
+    uint8_t dominant_axis;
+
+    float order_amp_1x;
+    float order_amp_2x;
+    float order_amp_3x;
+    float order_amp_4x;
+
+    float order_ratio_2x_1x;
+    float order_ratio_3x_1x;
+    float order_ratio_4x_1x;
+
+    /* ---------- Diagnóstico ---------- */
+
+    uint8_t score_normal;
+    uint8_t score_unbalance;
+    uint8_t score_misalignment;
+    uint8_t score_looseness;
+    uint8_t score_bearing;
+    uint8_t score_shock;
+
+    float diagnosis_confidence;
+} feature_vector_t; 
+
+static feature_vector_t features;
+
+typedef enum
+{
+    MACHINE_NORMAL,
+    MACHINE_UNBALANCE,
+    MACHINE_MISALINGMENT,
+    MACHINE_LOOSENESS,
+    MACHINE_BEARING_DAMAGE,
+    MACHINE_SHOCK
+} machine_state_t;
+
+typedef enum
+{
+    LEVEL_NORMAL,
+    LEVEL_WARNING,
+    LEVEL_ALARM,
+    LEVEL_CRITICAL
+} alarm_level_t;
+
+static machine_state_t machine_state;
+static alarm_level_t alarm_level;
+static void diagnose_machine(void);
+static float order_amplitude(
+    float target_order,
+    float tolerance);
+
+static machine_state_t detected_state = MACHINE_NORMAL;
+static machine_state_t current_state = MACHINE_NORMAL;
+static machine_state_t candidate_state = MACHINE_NORMAL;
+static uint8_t candidate_counter = 0;
+
+typedef struct
+{
+    uint8_t normal;
+    uint8_t unbalance;
+    uint8_t misalignment;
+    uint8_t looseness;
+    uint8_t bearing;
+    uint8_t shock;
+
+} diagnosis_score_t;
+
+static diagnosis_score_t score;
+
+/* ----------------------- Algoritmo -----------------------*/
+
+/* Función de conversión ADC - Fuerzas G*/ 
+static void convert_accel(
+    imu_state_t *imu,
+    int16_t ax,
+    int16_t ay,
+    int16_t az)
+{
+    imu->ax = ((float)ax / ACC_SCALE_2G) * G;
+    imu->ay = ((float)ay / ACC_SCALE_2G) * G;
+    imu->az = ((float)az / ACC_SCALE_2G) * G;
+}
+
+/* Tarea de adquisición */
+void task_motion(void *pvParameters)
+{
+    uint64_t last_timestamp = esp_timer_get_time();
+    imu_state_t imu = {0};
+
+    int16_t ax;
+    int16_t ay;
+    int16_t az;
+    
+    while(1)
+    {
+        if(bmi160_read_accel(&ax,&ay,&az)==ESP_OK)
+        {
+            /* Conversion */
+            convert_accel(&imu, ax, ay, az);
+
+            /* Offset */
+            remove_offset(&imu);
+
+            /* Gravity */
+            remove_gravity(&imu);
+
+            /* Filtrado */
+            low_pass_filter(&imu);
+
+            /* Timestamp */
+            int64_t now = esp_timer_get_time();
+
+            imu.dt = (now - last_timestamp) / 1000000.0f;
+
+            last_timestamp = now;
+            imu.timestamp = now;
+
+            /* Guardar la muestra en buffer circular */
+            fill_buffer[head] = imu;
+
+            head++;
+
+            if(head == WINDOW_SIZE)
+            {
+                if(!proceesing_busy)
+                {
+                    head = 0;
+
+                    imu_state_t *temp = process_buffer;
+                    process_buffer = fill_buffer;
+                    fill_buffer = temp;
+
+                    features.timestamp = process_buffer[WINDOW_SIZE-1].timestamp;
+
+                    processing_request = true;
+                }
+                else
+                {
+                    head = WINDOW_SIZE;
+                }
+            }
+        }
+
+    vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
+    }
+}
+
+/* Funciones de Preprocesamiento */
+static void calculate_offset(void){
+    int16_t ax, ay, az;
+    
+    float sum_x = 0.0f;
+    float sum_y = 0.0f;
+    float sum_z = 0.0f;
+
+    imu_state_t imu;
+
+    printf("Calculando offset...\n");
+
+    for(int i = 0; i < 1000; i++){
+        if(bmi160_read_accel(&ax, &ay, &az) == ESP_OK){
+            convert_accel(&imu, ax, ay, az);
+
+            sum_x += imu.ax;
+            sum_y += imu.ay;
+            sum_z += imu.az;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    offset_x = sum_x / 1000.0f;
+    offset_y = sum_y / 1000.0f;
+    offset_z = sum_z / 1000.0f;
+
+    printf("Offset:\n");
+    printf("X = %.5f\n", offset_x);
+    printf("Y = %.5f\n", offset_y);
+    printf("Z = %.5f\n", offset_z);
+}
+
+static void remove_offset(imu_state_t *imu){
+    imu->ax -= offset_x;
+    imu->ay -= offset_y;
+    imu->az -= offset_z;
+}
+
+static void remove_gravity(imu_state_t *imu){
+    /* Tecnicas con giroscopio a desarrollar */
+}
+
+static void low_pass_filter(imu_state_t *imu){
+    const float alpha = 0.2f;
+
+    fx += alpha * (imu->ax - fx);
+    fy += alpha * (imu->ay - fy);
+    fz += alpha * (imu->az - fz);
+
+    imu->ax = fx;
+    imu->ay = fy;
+    imu->az = fz; 
+}
+
+/* Configuración de datos de máquina */
+static void load_machine_configuration(void)
+{
+    /* Configuración temporal */
+    machine_rpm = 1800.0f;
+    shaft_frequency = machine_rpm / 60.0f;
+
+    printf("\n");
+    printf("====================\n");
+    printf(" Configuración de la máquina\n");
+    printf("====================\n");
+    printf("RPM                   : %.1f\n", machine_rpm);
+    printf("Frecuencia de giro    : %.2f Hz\n", shaft_frequency);
+    printf("\n");
+}
+
+/* Tenicas de procesamiento digital de señales */
+static void calculate_rms(void)
+{
+    float sum_x = 0.0f;
+    float sum_y = 0.0f;
+    float sum_z = 0.0f;
+
+    for(uint16_t i = 0; i < WINDOW_SIZE; i++)
+    {
+        float ax = process_buffer[i].ax;
+        float ay = process_buffer[i].ay;
+        float az = process_buffer[i].az;
+        
+        sum_x += ax * ax;
+        sum_y += ay * ay;
+        sum_z += az * az;
+    }
+
+    rms_x = sqrtf(sum_x / WINDOW_SIZE);
+    rms_y = sqrtf(sum_y / WINDOW_SIZE);
+    rms_z = sqrtf(sum_z / WINDOW_SIZE);
+
+    features.rms[0] = rms_x;
+    features.rms[1] = rms_y;
+    features.rms[2] = rms_z;
+}
+
+static void calculate_peak(void)
+{
+    peak_x = 0;
+    peak_y = 0;
+    peak_z = 0;
+
+    for(uint16_t i = 0; i < WINDOW_SIZE; i++)
+    {
+        float ax = fabsf(process_buffer[i].ax);
+        float ay = fabsf(process_buffer[i].ay);
+        float az = fabsf(process_buffer[i].az);
+
+
+        if(ax > peak_x)
+            peak_x = ax;
+
+        if(ay > peak_y)
+            peak_y = ay;
+
+        if(az > peak_z)
+            peak_z = az;
+    }
+
+    features.peak[0] = peak_x;
+    features.peak[1] = peak_y;
+    features.peak[2] = peak_z;
+}
+
+static void calculate_crest_factor(void)
+{
+    if(rms_x > 0.000001f)
+    {
+        crest_x = peak_x / rms_x;
+    }
+    else
+    {
+        crest_x = 0.0f;
+    }
+
+    if(rms_y > 0.000001f)
+    {
+        crest_y = peak_y / rms_y;
+    }
+    else
+    {
+        crest_y = 0.0f;
+    }
+
+    if(rms_z > 0.000001f)
+    {
+        crest_z = peak_z / rms_z;
+    }
+    else
+    {
+        crest_z = 0.0f;
+    }
+
+    features.crest[0] = crest_x;
+    features.crest[1] = crest_y;
+    features.crest[2] = crest_z;
+}
+
+static void calculate_kurtosis(void)
+{
+    float sum_x = 0.0f;
+    float sum_y = 0.0f;
+    float sum_z = 0.0f;
+
+    if(rms_x < 1e-6f || rms_y < 1e-6f || rms_z < 1e-6f)
+    {
+        kurtosis_x = 0;
+        kurtosis_y = 0;
+        kurtosis_z = 0;
+
+        return;
+    }
+
+    for(uint16_t i = 0; i < WINDOW_SIZE; i++)
+    {
+        float x = process_buffer[i].ax / rms_x;
+        float y = process_buffer[i].ay / rms_y;
+        float z = process_buffer[i].az / rms_z;
+
+        sum_x += x*x*x*x;
+        sum_y += y*y*y*y;
+        sum_z += z*z*z*z;
+    }
+
+    kurtosis_x = sum_x / WINDOW_SIZE;   
+    kurtosis_y = sum_y / WINDOW_SIZE;
+    kurtosis_z = sum_z / WINDOW_SIZE;
+
+    features.kurtosis[0] = kurtosis_x;
+    features.kurtosis[1] = kurtosis_y;
+    features.kurtosis[2] = kurtosis_z;
+}
+
+static void calculate_hann_window(void)
+{
+    for (int i = 0; i < FFT_SIZE; i++)
+    {
+        fft_window[i] = 0.5f * (1.0f - cosf((2.0f * M_PI * i)/(FFT_SIZE-1)));
+    }
+}
+
+static void find_fft_peaks(
+    float *fft_mag,
+    float *peak_freq,
+    float *peak_amp)
+{
+    for(int i = 0; i < FFT_TOP_PEAKS; i++)
+    {
+        peak_freq[i] = 0.0f;
+        peak_amp[i] = 0.0f;
+    }
+
+    for(int i = 2; i < FFT_SIZE/2 - 2; i++)
+    {
+        /* Buscar máximos locales */
+        if(fft_mag[i] > fft_mag[i-1] &&
+           fft_mag[i] > fft_mag[i+1])
+        {
+            bool separated = true;
+
+            /* Comprobar distancia mínima */
+            for(int k = 0; k < FFT_TOP_PEAKS; k++)
+            {
+                if(peak_freq[k] != 0.0f)
+                {
+                    float old_bin =
+                        peak_freq[k] * FFT_SIZE / SAMPLE_RATE_HZ;
+
+                    if(fabsf((float)i - old_bin) < MIN_PEAK_DISTANCE)
+                    {
+                        separated = false;
+                        break;
+                    }
+                }
+            }
+
+            if(!separated)
+                continue;
+
+            float amp = fft_mag[i];
+            float freq =
+                ((float)i * SAMPLE_RATE_HZ) / FFT_SIZE;
+
+            /* Insertar ordenado */
+            for(int k = 0; k < FFT_TOP_PEAKS; k++)
+            {
+                if(amp > peak_amp[k])
+                {
+                    for(int j = FFT_TOP_PEAKS-1; j > k; j--)
+                    {
+                        peak_amp[j] = peak_amp[j-1];
+                        peak_freq[j] = peak_freq[j-1];
+                    }
+
+                    peak_amp[k] = amp;
+                    peak_freq[k] = freq;
+
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static void process_fft_axis(
+    float *input,
+    float *fft_buffer,
+    float *fft_mag,
+    float *peak_freq,
+    float *peak_amp)
+{
+
+    for(int i = 0; i < FFT_SIZE; i++)
+    {
+        fft_buffer[2*i] =
+            input[i] * fft_window[i];
+
+        fft_buffer[2*i+1] = 0.0f;
+    }
+
+
+    dsps_fft2r_fc32(
+        fft_buffer,
+        FFT_SIZE
+    );
+
+    dsps_bit_rev_fc32(
+        fft_buffer,
+        FFT_SIZE
+    );
+
+    dsps_cplx2reC_fc32(
+        fft_buffer,
+        FFT_SIZE
+    );
+
+
+    for(int i = 0; i < FFT_SIZE/2; i++)
+    {
+        float real = fft_buffer[2*i];
+        float imag = fft_buffer[2*i+1];
+
+        fft_mag[i] =
+            sqrtf(real*real + imag*imag);
+    }
+
+    find_fft_peaks(fft_mag, peak_freq, peak_amp);
+}
+
+static void calculate_fft(void)
+{
+    static float input_x[FFT_SIZE];
+    static float input_y[FFT_SIZE];
+    static float input_z[FFT_SIZE];
+
+    for(int i = 0; i < FFT_SIZE; i++)
+    {
+        input_x[i] = process_buffer[i].ax;
+        input_y[i] = process_buffer[i].ay;
+        input_z[i] = process_buffer[i].az;
+    }
+
+    process_fft_axis(
+        input_x,
+        fft_buffer_x,
+        fft_mag_x,
+        fft_peak_freq_x,
+        fft_peak_amp_x);
+
+    process_fft_axis(
+        input_y,
+        fft_buffer_y,
+        fft_mag_y,
+        fft_peak_freq_y,
+        fft_peak_amp_y);
+
+    process_fft_axis(
+        input_z,
+        fft_buffer_z,
+        fft_mag_z,
+        fft_peak_freq_z,
+        fft_peak_amp_z);
+
+    for(int i = 0; i < FFT_TOP_PEAKS; i++)
+    {
+        features.fft_freq[0][i] = fft_peak_freq_x[i];
+        features.fft_amp [0][i] = fft_peak_amp_x[i];
+        
+        features.fft_freq[1][i] = fft_peak_freq_y[i];
+        features.fft_amp [1][i] = fft_peak_amp_y[i];
+        
+        features.fft_freq[2][i] = fft_peak_freq_z[i];
+        features.fft_amp [2][i] = fft_peak_amp_z[i];
+
+    }
+
+    float best_amp = 0.0f;
+    features.dominant_axis = 0;
+
+    for (int axis = 0; axis < 3; axis++)
+    {
+        if(features.fft_amp[axis][0] > best_amp)
+        {
+            best_amp = features.fft_amp[axis][0];
+
+            features.dominant_amp = features.fft_amp[axis][0];
+            features.dominant_freq = features.fft_freq[axis][0];
+            features.dominant_axis = axis;
+        }
+    }
+
+    if(shaft_frequency > 0.0f)
+    {
+        features.dominant_order = features.dominant_freq / shaft_frequency;
+    }
+    else
+    {
+        features.dominant_order = 0.0f;
+    }
+
+    features.order_amp_1x = order_amplitude(1.0f, 0.15f);
+    features.order_amp_2x = order_amplitude(2.0f, 0.15f);
+    features.order_amp_3x = order_amplitude(3.0f, 0.20f);
+    features.order_amp_4x = order_amplitude(4.0f, 0.20f);
+
+    if(features.order_amp_1x > 0.001f)
+    {
+        features.order_ratio_2x_1x =
+        features.order_amp_2x /
+        features.order_amp_1x;
+
+    features.order_ratio_3x_1x =
+        features.order_amp_3x /
+        features.order_amp_1x;
+
+    features.order_ratio_4x_1x =
+        features.order_amp_4x /
+        features.order_amp_1x;
+    }
+    else
+    {
+        features.order_ratio_2x_1x = 0;
+        features.order_ratio_3x_1x = 0;
+        features.order_ratio_4x_1x = 0;
+    }
+}
+
+static float order_amplitude(float target_order, float tolerance)
+{
+    float best_amp = 0.0f;
+
+    for(int axis = 0; axis < 3; axis++)
+    {
+        for(int peak = 0; peak < FFT_TOP_PEAKS; peak++)
+        {
+            if(shaft_frequency <= 0.0f)
+                continue;
+
+            float order =
+                features.fft_freq[axis][peak] /
+                shaft_frequency;
+
+            if(fabsf(order - target_order) <= tolerance)
+            {
+                if(features.fft_amp[axis][peak] > best_amp)
+                {
+                    best_amp =
+                        features.fft_amp[axis][peak];
+                }
+            }
+        }
+    }
+
+    return best_amp;
+}
+
+static void diagnose_machine(void)
+{
+    /*----------------------------------------
+      Reiniciar puntuaciones y Amplitudes de frecuencia
+    ----------------------------------------*/
+    score.normal = 0;
+    score.unbalance = 0;
+    score.misalignment = 0;
+    score.looseness = 0;
+    score.bearing = 0;
+    score.shock = 0;
+
+    /*----------------------------------------
+      Obtener el valor máximo de cada
+      característica entre los tres ejes
+    ----------------------------------------*/
+
+    float max_rms = features.rms[0];
+    float max_peak = features.peak[0];
+    float max_crest = features.crest[0];
+    float max_kurtosis = features.kurtosis[0];
+
+    for(int i = 1; i < 3; i++)
+    {
+        if(features.rms[i] > max_rms)
+            max_rms = features.rms[i];
+
+        if(features.peak[i] > max_peak)
+            max_peak = features.peak[i];
+
+        if(features.crest[i] > max_crest)
+            max_crest = features.crest[i];
+
+        if(features.kurtosis[i] > max_kurtosis)
+            max_kurtosis = features.kurtosis[i];
+    }
+
+    /*----------------------------------------
+      Asignación de puntos
+    ----------------------------------------*/
+
+    /* Máquina normal */
+
+    if(max_rms < 0.020f)
+        score.normal += 2;
+
+    if(max_crest < 4.0f)
+        score.normal += 2;
+
+    if(max_kurtosis < 3.5f)
+        score.normal += 2;
+
+
+    /* Desbalance */
+
+    if(max_rms > 0.030f)
+        score.unbalance += 3;
+
+    if(max_crest < 5.0f)
+        score.unbalance += 1;
+
+    if(max_kurtosis < 4.0f)
+        score.unbalance += 1;
+
+    if(features.order_amp_1x >
+       features.order_amp_2x * 2.0f)
+    {
+        score.unbalance += 5;
+    }
+
+
+    /* Desalineación */
+
+    if(max_rms > 0.020f)
+        score.misalignment += 1;
+
+    if(features.order_ratio_2x_1x > 0.5f)
+    {
+        score.misalignment += 5;
+    }
+
+
+    /* Holgura */
+    if(features.order_ratio_3x_1x > 0.30f)
+    {
+        score.looseness += 3;
+    }
+
+    if(features.order_ratio_4x_1x > 0.30f)
+    {
+        score.looseness += 3;
+    }
+
+
+    /* Rodamiento */
+
+    if(max_crest > 5.5f)
+        score.bearing += 3;
+
+    if(max_kurtosis > 5.0f)
+        score.bearing += 3;
+
+    if(max_peak > 0.04f)
+        score.bearing += 1;
+
+
+    /* Impacto */
+
+    if(max_crest > 8.0f)
+        score.shock += 4;
+
+    if(max_kurtosis > 8.0f)
+        score.shock += 4;
+
+    if(max_peak > 0.10f)
+        score.shock += 2;
+
+    /*----------------------------------------
+      Buscar el diagnóstico con mayor puntaje
+    ----------------------------------------*/
+
+    int best_score = score.normal;
+    detected_state = MACHINE_NORMAL;
+
+    if(score.unbalance > best_score)
+    {
+        best_score = score.unbalance;
+        detected_state = MACHINE_UNBALANCE;
+    }
+
+    if(score.misalignment > best_score)
+    {
+        best_score = score.misalignment;
+        detected_state = MACHINE_MISALINGMENT;
+    }
+
+    if(score.looseness > best_score)
+    {
+        best_score = score.looseness;
+        detected_state = MACHINE_LOOSENESS;
+    }
+
+    if(score.bearing > best_score)
+    {
+        best_score = score.bearing;
+        detected_state = MACHINE_BEARING_DAMAGE;
+    }
+
+    if(score.shock > best_score)
+    {
+        best_score = score.shock;
+        detected_state = MACHINE_SHOCK;
+    }
+
+    /*=========================================
+      Guardar resultados
+    =========================================*/
+
+    features.score_normal       = score.normal;
+    features.score_unbalance    = score.unbalance;
+    features.score_misalignment = score.misalignment;
+    features.score_looseness    = score.looseness;
+    features.score_bearing      = score.bearing;
+    features.score_shock        = score.shock;
+
+    int total =
+        score.normal +
+        score.unbalance +
+        score.misalignment +
+        score.looseness +
+        score.bearing +
+        score.shock;
+
+    if(total > 0)
+        features.diagnosis_confidence =
+            (100.0f * best_score) / total;
+    else
+        features.diagnosis_confidence = 0.0f;
+
+    /*----------------------------------------
+      Histéresis temporal
+    ----------------------------------------*/
+
+    if(detected_state != candidate_state)
+    {
+        candidate_state = detected_state;
+        candidate_counter = 1;
+    }
+    else
+    {
+        if(candidate_counter < 3)
+            candidate_counter++;
+    }
+
+    if(candidate_counter >= 3)
+    {
+        current_state = candidate_state;
+    }
+
+    machine_state = current_state;
+
+    /*----------------------------------------
+      Nivel de alarma
+    ----------------------------------------*/
+
+    switch(machine_state)
+    {
+        case MACHINE_NORMAL:
+            alarm_level = LEVEL_NORMAL;
+            break;
+
+        case MACHINE_UNBALANCE:
+            alarm_level = LEVEL_WARNING;
+            break;
+
+        case MACHINE_BEARING_DAMAGE:
+            alarm_level = LEVEL_ALARM;
+            break;
+
+        case MACHINE_SHOCK:
+            alarm_level = LEVEL_CRITICAL;
+            break;
+
+        default:
+            alarm_level = LEVEL_WARNING;
+            break;
+    }
+}
+
+static const char *state_to_string(machine_state_t state)
+{
+    switch(state)
+    {
+        case MACHINE_NORMAL:
+            return "NORMAL";
+
+        case MACHINE_UNBALANCE:
+            return "UNBALANCE";
+
+        case MACHINE_MISALINGMENT:
+            return "MISALIGNMENT";
+
+        case MACHINE_LOOSENESS:
+            return "LOOSENESS";
+
+        case MACHINE_BEARING_DAMAGE:
+            return "BEARING DAMAGE";
+
+        case MACHINE_SHOCK:
+            return "SHOCK";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static const char *alarm_to_string(alarm_level_t alarm)
+{
+    switch(alarm)
+    {
+        case LEVEL_NORMAL:
+            return "NORMAL";
+
+        case LEVEL_WARNING:
+            return "WARNING";
+
+        case LEVEL_ALARM:
+            return "ALARM";
+
+        case LEVEL_CRITICAL:
+            return "CRITICAL";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+/* Tarea de procesamiento digital de señales */
+void task_processing(void *pvParameters)
+{
+    while(1)
+    {
+        switch(dsp_state)
+        {
+            /* Caso de inicio */
+            case DSP_IDLE: 
+            if(processing_request)
+            {
+                processing_request = false;
+                proceesing_busy = true;
+                dsp_state = DSP_PREPARE;    
+            }
+            
+            break;
+
+            /* Caso de preparación */
+            case DSP_PREPARE:
+
+            dsp_state = DSP_RMS;
+            break;
+
+            /* Caso RMS */
+            case DSP_RMS:
+            
+            calculate_rms();
+            dsp_state = DSP_PEAK;
+            break;
+
+            /* Caso Peak */
+            case DSP_PEAK:
+
+            calculate_peak();
+            dsp_state = DSP_CRESTFACTOR;
+            break;
+
+            /* Caso Crest Factor */
+            case DSP_CRESTFACTOR:
+
+            calculate_crest_factor();
+            dsp_state = DSP_KURTOSIS;
+            break;
+
+            /* Caso Kurtosis */
+            case DSP_KURTOSIS:
+
+            calculate_kurtosis();
+            dsp_state = DSP_FFT;
+            break;
+
+            /* Caso FFT */
+            case DSP_FFT:
+
+            calculate_fft();
+            dsp_state = DSP_DIAGNOSIS;
+            break;
+
+            /* Diagnostico */
+            case DSP_DIAGNOSIS:
+
+            diagnose_machine();
+            dsp_state = DSP_FINISH;
+            break;
+
+            /* Caso Finish */
+            case DSP_FINISH:
+            
+            processing_finished = true;
+            proceesing_busy = false;
+            dsp_state = DSP_IDLE;
+            
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/* Tarea de depuración */
+void task_debug(void *pvParameters)
+{
+    while(1)
+    {
+        if(processing_finished)
+        {
+            processing_finished = false;
+            
+            printf("\n");
+            printf("============================================================\n");
+            printf("               SMMR v3.0 - DIAGNOSTIC REPORT\n");
+            printf("============================================================\n");
+            
+            printf("Machine State : %s\n", state_to_string(machine_state));
+            printf("Alarm Level   : %s\n", alarm_to_string(alarm_level));
+            printf("Confidence    : %.1f %%\n", features.diagnosis_confidence);
+            printf("Timestamp     : %llu us\n", features.timestamp);
+            
+            printf("\n");
+            printf("---------------- RMS (m/s²) ----------------\n");
+            printf("X: %.5f   Y: %.5f   Z: %.5f\n",
+                features.rms[0],
+                features.rms[1],
+                features.rms[2]);
+                
+            printf("\n");
+            printf("---------------- Peak (m/s²) ---------------\n");
+            printf("X: %.5f   Y: %.5f   Z: %.5f\n",
+                features.peak[0],
+                features.peak[1],
+                features.peak[2]);
+                
+            printf("\n");
+            printf("--------------- Crest Factor ---------------\n");
+            printf("X: %.2f    Y: %.2f    Z: %.2f\n",
+                features.crest[0],
+                features.crest[1],
+                features.crest[2]);
+                
+            printf("\n");
+            printf("---------------- Kurtosis ------------------\n");
+            printf("X: %.2f    Y: %.2f    Z: %.2f\n",
+                features.kurtosis[0],
+                features.kurtosis[1],
+                features.kurtosis[2]);
+                
+            printf("\n");
+            printf("------------ Dominant Frequency ------------\n");
+            printf("Axis       : %c\n", 'X' + features.dominant_axis);
+            printf("Frequency  : %.2f Hz\n", features.dominant_freq);
+            printf("Amplitude  : %.3f\n", features.dominant_amp);
+            printf("Order      : %.2fX\n", features.dominant_order);
+            printf("\n");
+            
+            printf("-------------- Order Tracking --------------\n");
+            printf("1X : %.3f\n", features.order_amp_1x);
+            printf("2X : %.3f   (%.2f)\n",
+                features.order_amp_2x,
+                features.order_ratio_2x_1x);
+                
+            printf("3X : %.3f   (%.2f)\n",
+                features.order_amp_3x,
+                features.order_ratio_3x_1x);
+                
+            printf("4X : %.3f   (%.2f)\n",
+                features.order_amp_4x,
+                features.order_ratio_4x_1x);
+                
+            printf("\n");
+            printf("---------------- FFT Peaks -----------------\n");
+            
+            for(int axis = 0; axis < 3; axis++)
+            {
+                printf("%c : ", 'X' + axis);
+                
+                for(int i = 0; i < FFT_TOP_PEAKS; i++)
+                {
+                    printf("[%.2f Hz | %.3f] ",
+                        features.fft_freq[axis][i],
+                        features.fft_amp[axis][i]);
+                }
+
+                printf("\n");
+            }
+            
+            printf("\n");
+            printf("------------- Diagnosis Score --------------\n");
+            
+            printf("Normal       : %2d\n", features.score_normal);
+            printf("Unbalance    : %2d\n", features.score_unbalance);
+            printf("Misalignment : %2d\n", features.score_misalignment);
+            printf("Looseness    : %2d\n", features.score_looseness);
+            printf("Bearing      : %2d\n", features.score_bearing);
+            printf("Shock        : %2d\n", features.score_shock);
+            printf("============================================================\n");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+/* Aplicación principal */
+void app_main(void)
+{
+    esp_err_t ret;
+
+    printf("\n");
+    printf("=====================================\n");
+    printf(" SMMR v3.0\n");
+    printf(" Inicializando...\n");
+    printf("=====================================\n");
+
+    /* Inicializar BMI160 */
+    ret = bmi160_init();
+
+    if(ret != ESP_OK)
+    {
+        printf("Error inicializando BMI160: %s\n",
+               esp_err_to_name(ret));
+
+        while(1)
+            vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    printf("BMI160 inicializado correctamente.\n");
+
+    /* Calibración */
+    calculate_offset();
+
+    printf("Calibración finalizada.\n");
+
+    /* Configuración de máquina */
+    load_machine_configuration();
+
+    ret = dsps_fft2r_init_fc32(NULL, FFT_SIZE);
+    
+    if(ret != ESP_OK)
+    {
+        printf("Error inicializando FFT\n");
+        while(1);
+    }
+    
+    calculate_hann_window();
+
+    xTaskCreatePinnedToCore(
+        task_motion,
+        "Motion",
+        4096,
+        NULL,
+        5,
+        NULL,
+        0);
+
+    xTaskCreatePinnedToCore(
+        task_processing,
+        "Processing",
+        4096,
+        NULL,
+        3,
+        NULL,
+        1    
+    );
+
+    xTaskCreatePinnedToCore(
+        task_debug,
+        "Debug",
+        4096,
+        NULL,
+        1,
+        NULL,
+        1);
+
+    printf("Sistema iniciado.\n");
+}
