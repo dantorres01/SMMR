@@ -5,6 +5,7 @@
 #include <math.h>
 #include "esp_dsp.h"
 
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -17,10 +18,19 @@
 
 #include "smmr_types.h"
 
+#include "modbus_server.h"
+
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+
+static const char *TAG = "SMMR";
+
 /* --- Instancias --- */
 
-#define SAMPLE_RATE_HZ 100
-#define SAMPLE_PERIOD_MS 10
+#define SAMPLE_RATE_HZ 200
+#define SAMPLE_PERIOD_MS 5
 
 #define ACC_SCALE_2G 16384.0f
 #define G 9.80665f
@@ -42,6 +52,8 @@ typedef struct
     /* Timestamp absoluto */
     uint64_t timestamp;
 } imu_state_t;
+
+static smmr_telemetry_t telemetry;
 
 /* Buffers circulares */
 #define WINDOW_SIZE 1024
@@ -70,6 +82,90 @@ static float fz = 0;
 static float machine_rpm = 0.0f;
 static float shaft_frequency = 0.0f;
 
+typedef struct
+{
+    const char *manufacturer;
+    const char *model;
+
+    uint8_t poles;
+
+    /* Datos nominales */
+    float rated_frequency_hz;
+    float rated_rpm;
+    float rated_power_kw;
+
+    /* Alimentación utilizada */
+    float supply_frequency_hz;
+    float supply_voltage_v;
+
+    /* Velocidades */
+    float synchronous_rpm;
+
+    /*
+       RPM utilizadas por el algoritmo.
+
+       De momento son estimadas.
+       Posteriormente se sustituirán
+       por las RPM medidas con tacómetro.
+    */
+    float operating_rpm;
+
+    bool rpm_measured;
+
+    /* Frecuencia mecánica */
+    float shaft_frequency_hz;
+
+} machine_config_t;
+
+static machine_config_t machine;
+
+typedef struct
+{
+    bool valid;
+
+    float rms[3];
+    float peak[3];
+
+    float amp_1x;
+    float amp_2x;
+    float amp_3x;
+
+} machine_baseline_t;
+
+typedef struct
+{
+    uint8_t count;
+
+    float rms_sum[3];
+    float peak_sum[3];
+
+    float amp_1x_sum;
+    float amp_2x_sum;
+    float amp_3x_sum;
+
+} baseline_accumulator_t;
+
+static float baseline_max_rms(void);
+
+
+static baseline_accumulator_t baseline_accumulator =
+{
+    .count = 0
+};
+
+#define BASELINE_WINDOWS              5
+#define BASELINE_STABILIZATION_WINDOWS 2    
+
+static uint8_t baseline_stability_counter = 0;
+
+static void reset_baseline_learning(void);
+static void update_baseline(void);
+
+static machine_baseline_t baseline =
+{
+    .valid = false
+};
+
 /* Funciones de preprocesamiento */
 static void calculate_offset(void);
 static void remove_offset(imu_state_t *imu);
@@ -96,6 +192,8 @@ static void find_fft_peaks(
     float *fft_mag,
     float *peak_freq,
     float *peak_amp);
+
+static float fft_window_sum = 0.0f;
 
 static void calculate_kurtosis(void);
 
@@ -156,71 +254,41 @@ typedef enum
 
 static dsp_state_t dsp_state = DSP_IDLE;
 
-typedef struct 
-{
-    uint64_t timestamp;
-
-    float rms[3];
-
-    float peak[3];
-
-    float crest[3];
-
-    float kurtosis[3];
-
-    float fft_freq[3][FFT_TOP_PEAKS];
-    float fft_amp[3][FFT_TOP_PEAKS];
-
-    float dominant_freq;
-    float dominant_amp;
-    float dominant_order;
-
-    uint8_t dominant_axis;
-
-    float order_amp_1x;
-    float order_amp_2x;
-    float order_amp_3x;
-    float order_amp_4x;
-
-    float order_ratio_2x_1x;
-    float order_ratio_3x_1x;
-    float order_ratio_4x_1x;
-
-    /* ---------- Diagnóstico ---------- */
-
-    uint8_t score_normal;
-    uint8_t score_unbalance;
-    uint8_t score_misalignment;
-    uint8_t score_looseness;
-    uint8_t score_bearing;
-    uint8_t score_shock;
-
-    float diagnosis_confidence;
-} feature_vector_t; 
-
 static feature_vector_t features;
-
-typedef enum
-{
-    MACHINE_NORMAL,
-    MACHINE_UNBALANCE,
-    MACHINE_MISALINGMENT,
-    MACHINE_LOOSENESS,
-    MACHINE_BEARING_DAMAGE,
-    MACHINE_SHOCK
-} machine_state_t;
-
-typedef enum
-{
-    LEVEL_NORMAL,
-    LEVEL_WARNING,
-    LEVEL_ALARM,
-    LEVEL_CRITICAL
-} alarm_level_t;
 
 static machine_state_t machine_state;
 static alarm_level_t alarm_level;
 static void diagnose_machine(void);
+
+static int eval_normal(
+    float max_rms,
+    float max_peak,
+    float max_crest,
+    float max_kurtosis);
+
+static int eval_unbalance(
+    float max_rms,
+    float max_peak,
+    float max_crest,
+    float max_kurtosis);
+
+static int eval_misalignment(
+    float max_rms);
+
+static int eval_looseness(
+    float max_rms);
+
+static int eval_bearing(
+    float max_rms,
+    float max_peak,
+    float max_crest,
+    float max_kurtosis);
+
+static int eval_shock(
+    float max_peak,
+    float max_crest,
+    float max_kurtosis);
+
 static float order_amplitude(
     float target_order,
     float tolerance);
@@ -230,18 +298,58 @@ static machine_state_t current_state = MACHINE_NORMAL;
 static machine_state_t candidate_state = MACHINE_NORMAL;
 static uint8_t candidate_counter = 0;
 
-typedef struct
-{
-    uint8_t normal;
-    uint8_t unbalance;
-    uint8_t misalignment;
-    uint8_t looseness;
-    uint8_t bearing;
-    uint8_t shock;
-
-} diagnosis_score_t;
-
 static diagnosis_score_t score;
+
+typedef enum
+{
+    MACHINE_STOPPED = 0,
+    MACHINE_RUNNING
+} machine_run_state_t;
+
+static machine_run_state_t
+machine_run_state = MACHINE_STOPPED;
+
+/*=========================================
+  Parámetros de diagnóstico
+=========================================*/
+
+#define DIAG_MIN_RMS                0.015f
+
+/* Desbalance */
+#define UNBALANCE_ORDER_TOLERANCE   0.15f
+#define UNBALANCE_1X_2X_RATIO       1.50f
+
+/* Desalineación */
+#define MISALIGN_2X_1X_RATIO        0.50f
+#define MISALIGN_SEVERE_RATIO       1.00f
+
+/* Holgura */
+#define LOOSENESS_2X_1X_RATIO       0.30f
+#define LOOSENESS_3X_1X_RATIO       0.20f
+#define LOOSENESS_4X_1X_RATIO       0.20f
+
+/*=========================================
+  Comparación contra baseline
+=========================================*/
+
+#define BASELINE_NORMAL_TOLERANCE       0.20f
+
+#define UNBALANCE_RMS_INCREASE          1.20f
+#define UNBALANCE_1X_INCREASE           1.20f
+
+#define MISALIGN_2X_BASELINE_INCREASE   1.50f
+
+#define LOOSENESS_2X_BASELINE_INCREASE  1.50f
+#define LOOSENESS_3X_BASELINE_INCREASE  1.50f
+
+#define RUNNING_RMS_THRESHOLD 0.10f
+#define RUNNING_1X_THRESHOLD 0.10f
+#define RUNNING_CONFIRM_WINDOWS 2
+#define STOPPED_CONFIRM_WINDOWS 2
+
+static bool machine_activity_detected(void);
+static void update_machine_run_state(void);
+
 
 /* ----------------------- Algoritmo -----------------------*/
 
@@ -260,64 +368,96 @@ static void convert_accel(
 /* Tarea de adquisición */
 void task_motion(void *pvParameters)
 {
-    uint64_t last_timestamp = esp_timer_get_time();
+    uint64_t last_timestamp =
+        esp_timer_get_time();
+
     imu_state_t imu = {0};
 
     int16_t ax;
     int16_t ay;
     int16_t az;
-    
+
+    /*
+       Mantiene el periodo de adquisición
+       respecto a una referencia temporal fija.
+    */
+    TickType_t last_wake_time =
+        xTaskGetTickCount();
+
+
     while(1)
     {
-        if(bmi160_read_accel(&ax,&ay,&az)==ESP_OK)
+        if(bmi160_read_accel(
+            &ax,
+            &ay,
+            &az) == ESP_OK)
         {
-            /* Conversion */
-            convert_accel(&imu, ax, ay, az);
+            convert_accel(
+                &imu,
+                ax,
+                ay,
+                az
+            );
 
-            /* Offset */
             remove_offset(&imu);
-
-            /* Gravity */
             remove_gravity(&imu);
 
-            /* Filtrado */
-            low_pass_filter(&imu);
+            /*
+               low_pass_filter().
+            */
 
-            /* Timestamp */
-            int64_t now = esp_timer_get_time();
+            uint64_t now =
+                esp_timer_get_time();
 
-            imu.dt = (now - last_timestamp) / 1000000.0f;
+            imu.dt =
+                (now - last_timestamp)
+                / 1000000.0f;
 
             last_timestamp = now;
+
             imu.timestamp = now;
 
-            /* Guardar la muestra en buffer circular */
-            fill_buffer[head] = imu;
+            if(head < WINDOW_SIZE)
+            {
+                /*
+                   UNA muestra leída =
+                   UNA posición del buffer.
+                */
 
-            head++;
+                fill_buffer[head] = imu;
 
-            if(head == WINDOW_SIZE)
+                head++;
+            }
+
+            if(head >= WINDOW_SIZE)
             {
                 if(!proceesing_busy)
                 {
-                    head = 0;
-
                     imu_state_t *temp = process_buffer;
+
                     process_buffer = fill_buffer;
+
                     fill_buffer = temp;
 
-                    features.timestamp = process_buffer[WINDOW_SIZE-1].timestamp;
+                    features.timestamp =
+                        process_buffer[
+                            WINDOW_SIZE - 1
+                        ].timestamp;
 
-                    processing_request = true;
-                }
-                else
-                {
-                    head = WINDOW_SIZE;
+                    head = 0;
+
+                    processing_request =
+                        true;
                 }
             }
         }
 
-    vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
+        vTaskDelayUntil(
+            &last_wake_time,
+            pdMS_TO_TICKS(
+                SAMPLE_PERIOD_MS
+            )
+        );
     }
 }
 
@@ -365,7 +505,7 @@ static void remove_gravity(imu_state_t *imu){
     /* Tecnicas con giroscopio a desarrollar */
 }
 
-static void low_pass_filter(imu_state_t *imu){
+/*static void low_pass_filter(imu_state_t *imu){
     const float alpha = 0.2f;
 
     fx += alpha * (imu->ax - fx);
@@ -375,22 +515,176 @@ static void low_pass_filter(imu_state_t *imu){
     imu->ax = fx;
     imu->ay = fy;
     imu->az = fz; 
+}*/
+
+static void reset_baseline_learning(void)
+{
+    baseline_stability_counter = 0;
+
+    baseline_accumulator.count = 0;
+
+    for(int i = 0; i < 3; i++)
+    {
+        baseline_accumulator.rms_sum[i] = 0.0f;
+        baseline_accumulator.peak_sum[i] = 0.0f;
+    }
+
+    baseline_accumulator.amp_1x_sum = 0.0f;
+    baseline_accumulator.amp_2x_sum = 0.0f;
+    baseline_accumulator.amp_3x_sum = 0.0f;
 }
 
-/* Configuración de datos de máquina */
-static void load_machine_configuration(void)
+static void update_baseline(void)
 {
-    /* Configuración temporal */
-    machine_rpm = 1800.0f;
-    shaft_frequency = machine_rpm / 60.0f;
+    /*=========================================
+      1. Periodo de estabilización
+    =========================================*/
+
+    if(baseline_stability_counter <
+       BASELINE_STABILIZATION_WINDOWS)
+    {
+        baseline_stability_counter++;
+
+        printf(
+            "Baseline: stabilizing (%u/%u)\n",
+            baseline_stability_counter,
+            BASELINE_STABILIZATION_WINDOWS
+        );
+
+        return;
+    }
+
+
+    /*=========================================
+      2. Acumular ventana
+    =========================================*/
+
+    for(int i = 0; i < 3; i++)
+    {
+        baseline_accumulator.rms_sum[i] +=
+            features.rms[i];
+
+        baseline_accumulator.peak_sum[i] +=
+            features.peak[i];
+    }
+
+    baseline_accumulator.amp_1x_sum +=
+        features.order_amp_1x;
+
+    baseline_accumulator.amp_2x_sum +=
+        features.order_amp_2x;
+
+    baseline_accumulator.amp_3x_sum +=
+        features.order_amp_3x;
+
+
+    baseline_accumulator.count++;
+
+
+    printf(
+        "Baseline: learning (%u/%u)\n",
+        baseline_accumulator.count,
+        BASELINE_WINDOWS
+    );
+
+
+    /*=========================================
+      3. ¿Ya tenemos cinco ventanas?
+    =========================================*/
+
+    if(baseline_accumulator.count <
+       BASELINE_WINDOWS)
+    {
+        return;
+    }
+
+
+    /*=========================================
+      4. Calcular promedio
+    =========================================*/
+
+    for(int i = 0; i < 3; i++)
+    {
+        baseline.rms[i] =
+            baseline_accumulator.rms_sum[i] /
+            BASELINE_WINDOWS;
+
+        baseline.peak[i] =
+            baseline_accumulator.peak_sum[i] /
+            BASELINE_WINDOWS;
+    }
+
+
+    baseline.amp_1x =
+        baseline_accumulator.amp_1x_sum /
+        BASELINE_WINDOWS;
+
+    baseline.amp_2x =
+        baseline_accumulator.amp_2x_sum /
+        BASELINE_WINDOWS;
+
+    baseline.amp_3x =
+        baseline_accumulator.amp_3x_sum /
+        BASELINE_WINDOWS;
+
+
+    /*=========================================
+      5. Activar baseline
+    =========================================*/
+
+    baseline.valid = true;
+
 
     printf("\n");
-    printf("====================\n");
-    printf(" Configuración de la máquina\n");
-    printf("====================\n");
-    printf("RPM                   : %.1f\n", machine_rpm);
-    printf("Frecuencia de giro    : %.2f Hz\n", shaft_frequency);
-    printf("\n");
+    printf("====================================\n");
+    printf(" BASELINE COMPLETED\n");
+    printf("====================================\n");
+
+    printf(
+        "RMS  : X=%.5f Y=%.5f Z=%.5f\n",
+        baseline.rms[0],
+        baseline.rms[1],
+        baseline.rms[2]
+    );
+
+    printf(
+        "Peak : X=%.5f Y=%.5f Z=%.5f\n",
+        baseline.peak[0],
+        baseline.peak[1],
+        baseline.peak[2]
+    );
+
+    printf(
+        "1X   : %.3f\n",
+        baseline.amp_1x
+    );
+
+    printf(
+        "2X   : %.3f\n",
+        baseline.amp_2x
+    );
+
+    printf(
+        "3X   : %.3f\n",
+        baseline.amp_3x
+    );
+
+    printf("====================================\n");
+}
+
+static float baseline_max_rms(void)
+{
+    float max_rms = baseline.rms[0];
+
+    for(int i = 1; i < 3; i++)
+    {
+        if(baseline.rms[i] > max_rms)
+        {
+            max_rms = baseline.rms[i];
+        }
+    }
+
+    return max_rms;
 }
 
 /* Tenicas de procesamiento digital de señales */
@@ -519,9 +813,19 @@ static void calculate_kurtosis(void)
 
 static void calculate_hann_window(void)
 {
-    for (int i = 0; i < FFT_SIZE; i++)
+    fft_window_sum = 0.0f;
+
+    for(int i = 0; i < FFT_SIZE; i++)
     {
-        fft_window[i] = 0.5f * (1.0f - cosf((2.0f * M_PI * i)/(FFT_SIZE-1)));
+        fft_window[i] =
+            0.5f *
+            (1.0f -
+             cosf(
+                 (2.0f * M_PI * i) /
+                 (FFT_SIZE - 1)
+             ));
+
+        fft_window_sum += fft_window[i];
     }
 }
 
@@ -626,8 +930,19 @@ static void process_fft_axis(
         float real = fft_buffer[2*i];
         float imag = fft_buffer[2*i+1];
 
-        fft_mag[i] =
-            sqrtf(real*real + imag*imag);
+        float magnitude = sqrtf(real * real + imag * imag);
+
+        /* Normalización de amplitud para
+        espectro unilateral con ventana Hann. */
+        
+        if(i == 0)
+        {
+            fft_mag[i] = magnitude / fft_window_sum;
+        }
+        else
+        {
+            fft_mag[i] = (2.0f * magnitude) / fft_window_sum;
+        }
     }
 
     find_fft_peaks(fft_mag, peak_freq, peak_amp);
@@ -731,199 +1046,939 @@ static void calculate_fft(void)
     }
 }
 
-static float order_amplitude(float target_order, float tolerance)
+/* Configuración de datos de máquina */
+static void load_machine_configuration(void)
 {
+    /*=========================================
+      MGM Motori Elettrici BM 63 B4
+    =========================================*/
+
+    machine.manufacturer = "M.G.M. Motori Elettrici";
+    machine.model = "BM 63 B4";
+
+    /* Motor de cuatro polos */
+    machine.poles = 4;
+
+    /* Datos nominales */
+    machine.rated_frequency_hz = 50.0f;
+    machine.rated_rpm = 1350.0f;
+    machine.rated_power_kw = 0.18f;
+
+    /* Condiciones de alimentación actuales */
+    machine.supply_frequency_hz = 60.0f;
+    machine.supply_voltage_v = 220.0f;
+
+
+    /*=========================================
+      Velocidad síncrona
+    =========================================*/
+
+    machine.synchronous_rpm =
+        (120.0f * machine.supply_frequency_hz) /
+        (float)machine.poles;
+
+
+    /*=========================================
+      Velocidad utilizada para Order Tracking
+    =========================================*/
+
+    /*
+       Estimación inicial.
+
+       Motor 4 polos + 60 Hz:
+       velocidad síncrona = 1800 RPM.
+
+       Las pruebas anteriores mostraron una
+       componente dominante de ~29.9 Hz,
+       equivalente a ~1794 RPM.
+
+       Hasta medir con tacómetro se utiliza
+       1800 RPM como referencia estimada.
+    */
+
+    machine.operating_rpm = 1800.0f;
+
+    machine.rpm_measured = false;
+
+
+    /* Frecuencia mecánica */
+
+    machine.shaft_frequency_hz =
+        machine.operating_rpm / 60.0f;
+
+
+    /* Variables utilizadas actualmente
+       por el resto del algoritmo */
+
+    machine_rpm =
+        machine.operating_rpm;
+
+    shaft_frequency =
+        machine.shaft_frequency_hz;
+
+
+    /*=========================================
+      Reporte
+    =========================================*/
+
+    printf("\n");
+    printf("====================================\n");
+    printf(" Configuracion de la maquina\n");
+    printf("====================================\n");
+
+    printf("Fabricante             : %s\n",
+           machine.manufacturer);
+
+    printf("Modelo                 : %s\n",
+           machine.model);
+
+    printf("Polos                  : %u\n",
+           machine.poles);
+
+    printf("Potencia nominal       : %.2f kW\n",
+           machine.rated_power_kw);
+
+    printf("Frecuencia nominal     : %.1f Hz\n",
+           machine.rated_frequency_hz);
+
+    printf("RPM nominales (50 Hz)  : %.1f RPM\n",
+           machine.rated_rpm);
+
+    printf("Alimentacion           : %.0f V / %.1f Hz\n",
+           machine.supply_voltage_v,
+           machine.supply_frequency_hz);
+
+    printf("RPM sincronas (60 Hz)  : %.1f RPM\n",
+           machine.synchronous_rpm);
+
+    printf("RPM usadas en analisis : %.1f RPM %s\n",
+           machine.operating_rpm,
+           machine.rpm_measured ?
+           "(MEDIDAS)" :
+           "(ESTIMADAS)");
+
+    printf("Frecuencia de giro     : %.2f Hz\n",
+           machine.shaft_frequency_hz);
+
+    printf("====================================\n");
+    printf("\n");
+}
+
+static bool order_is_observable(float order)
+{
+    if(shaft_frequency <= 0.0f)
+        return false;
+
+    float frequency =
+        shaft_frequency * order;
+
+    float nyquist =
+        SAMPLE_RATE_HZ / 2.0f;
+
+    /*
+       Dejamos un pequeño margen respecto
+       a Nyquist.
+    */
+
+    return frequency < (nyquist * 0.95f);
+}
+
+static float order_amplitude(
+    float target_order,
+    float tolerance)
+{
+    if(shaft_frequency <= 0.0f)
+        return 0.0f;
+
+
+    float target_frequency =
+        shaft_frequency * target_order;
+
+
+    /*=========================================
+      Comprobar Nyquist
+    =========================================*/
+
+    float nyquist_frequency =
+        SAMPLE_RATE_HZ / 2.0f;
+
+
+    if(target_frequency >= nyquist_frequency)
+    {
+        /*
+           Esa orden no puede medirse con
+           la frecuencia de muestreo actual.
+        */
+
+        return 0.0f;
+    }
+
+
     float best_amp = 0.0f;
+
+
+    /*=========================================
+      Buscar directamente en todo el espectro
+    =========================================*/
 
     for(int axis = 0; axis < 3; axis++)
     {
-        for(int peak = 0; peak < FFT_TOP_PEAKS; peak++)
+        float *spectrum = NULL;
+
+        switch(axis)
         {
-            if(shaft_frequency <= 0.0f)
-                continue;
+            case 0:
+                spectrum = fft_mag_x;
+                break;
+
+            case 1:
+                spectrum = fft_mag_y;
+                break;
+
+            case 2:
+                spectrum = fft_mag_z;
+                break;
+        }
+
+
+        for(int bin = 1;
+            bin < FFT_SIZE / 2;
+            bin++)
+        {
+            float frequency =
+                ((float)bin *
+                 SAMPLE_RATE_HZ) /
+                FFT_SIZE;
+
 
             float order =
-                features.fft_freq[axis][peak] /
+                frequency /
                 shaft_frequency;
 
-            if(fabsf(order - target_order) <= tolerance)
+
+            if(fabsf(order - target_order)
+               <= tolerance)
             {
-                if(features.fft_amp[axis][peak] > best_amp)
+                if(spectrum[bin] > best_amp)
                 {
                     best_amp =
-                        features.fft_amp[axis][peak];
+                        spectrum[bin];
                 }
             }
         }
     }
 
+
     return best_amp;
 }
 
-static void diagnose_machine(void)
+static int eval_normal(
+    float max_rms,
+    float max_peak,
+    float max_crest,
+    float max_kurtosis)
 {
-    /*----------------------------------------
-      Reiniciar puntuaciones y Amplitudes de frecuencia
-    ----------------------------------------*/
-    score.normal = 0;
-    score.unbalance = 0;
-    score.misalignment = 0;
-    score.looseness = 0;
-    score.bearing = 0;
-    score.shock = 0;
+    int points = 0;
 
-    /*----------------------------------------
-      Obtener el valor máximo de cada
-      característica entre los tres ejes
-    ----------------------------------------*/
 
+    if(!baseline.valid)
+    {
+        return 0;
+    }
+
+
+    float baseline_rms =
+        baseline_max_rms();
+
+
+    if(baseline_rms <= 0.000001f)
+    {
+        return 0;
+    }
+
+
+    float rms_ratio =
+        max_rms /
+        baseline_rms;
+
+    float ratio_1x =
+        features.order_amp_1x /
+        baseline.amp_1x;
+
+
+    /*
+       RMS próximo al baseline.
+    */
+
+    if(rms_ratio >=
+           (1.0f - BASELINE_NORMAL_TOLERANCE) &&
+       rms_ratio <=
+           (1.0f + BASELINE_NORMAL_TOLERANCE))
+    {
+        points += 3;
+    }
+
+
+    /*
+       1X próximo a la firma sana.
+    */
+
+    if(ratio_1x >=
+           (1.0f - BASELINE_NORMAL_TOLERANCE) &&
+       ratio_1x <=
+           (1.0f + BASELINE_NORMAL_TOLERANCE))
+    {
+        points += 3;
+    }
+
+
+    /*
+       Firma poco impulsiva.
+    */
+
+    if(max_crest < 4.0f)
+    {
+        points += 1;
+    }
+
+
+    if(max_kurtosis < 3.5f)
+    {
+        points += 1;
+    }
+
+
+    return points;
+}
+
+static int eval_unbalance(
+    float max_rms,
+    float max_peak,
+    float max_crest,
+    float max_kurtosis)
+{
+    int points = 0;
+
+
+    if(!baseline.valid)
+    {
+        return 0;
+    }
+
+
+    if(!order_is_observable(1.0f))
+    {
+        return 0;
+    }
+
+
+    if(features.order_amp_1x <= 0.001f ||
+       baseline.amp_1x <= 0.001f)
+    {
+        return 0;
+    }
+
+
+    float baseline_rms =
+        baseline_max_rms();
+
+    if(baseline_rms <= 0.000001f)
+    {
+        return 0;
+    }
+
+
+    float rms_ratio =
+        max_rms /
+        baseline_rms;
+
+    float amp_1x_ratio =
+        features.order_amp_1x /
+        baseline.amp_1x;
+
+
+    /*
+       1X debe seguir siendo dominante.
+    */
+
+    if(fabsf(
+           features.dominant_order - 1.0f
+       ) <= UNBALANCE_ORDER_TOLERANCE)
+    {
+        points += 2;
+    }
+
+
+    /*
+       Evidencia principal:
+       aumento real de 1X respecto al motor sano.
+    */
+
+    if(amp_1x_ratio >
+       UNBALANCE_1X_INCREASE)
+    {
+        points += 4;
+    }
+
+
+    /*
+       RMS global también aumenta.
+    */
+
+    if(rms_ratio >
+       UNBALANCE_RMS_INCREASE)
+    {
+        points += 2;
+    }
+
+
+    /*
+       El desbalance normalmente conserva
+       una señal periódica y poco impulsiva.
+    */
+
+    if(features.order_ratio_2x_1x < 0.20f && features.order_ratio_3x_1x < 0.10f)
+    {
+        points += 1;
+    }
+
+    return points;
+}
+
+static int eval_misalignment(
+    float max_rms)
+{
+    int points = 0;
+
+    if(!baseline.valid)
+        return 0;
+
+    if(!order_is_observable(2.0f))
+        return 0;
+
+    if(features.order_amp_1x <= 0.001f ||
+       baseline.amp_2x <= 0.001f)
+    {
+        return 0;
+    }
+
+
+    float ratio_2x_1x =
+        features.order_ratio_2x_1x;
+
+    float growth_2x =
+        features.order_amp_2x /
+        baseline.amp_2x;
+
+
+    /*
+       Evidencia de desalineación:
+       2X debe crecer respecto al baseline
+       Y además ser relevante frente a 1X.
+    */
+
+    if(growth_2x >
+           MISALIGN_2X_BASELINE_INCREASE &&
+       ratio_2x_1x >
+           MISALIGN_2X_1X_RATIO)
+    {
+        points += 5;
+    }
+
+
+    /*
+       Evidencia severa:
+       2X igual o superior a 1X.
+    */
+
+    if(ratio_2x_1x >
+       MISALIGN_SEVERE_RATIO)
+    {
+        points += 2;
+    }
+
+
+    return points;
+}
+
+static int eval_looseness(
+    float max_rms)
+{
+    int points = 0;
+
+    if(!baseline.valid)
+        return 0;
+
+    if(features.order_amp_1x <= 0.001f)
+        return 0;
+
+
+    bool harmonic_2x = false;
+    bool harmonic_3x = false;
+    bool harmonic_4x = false;
+
+
+    /*=========================================
+      2X
+    =========================================*/
+
+    if(order_is_observable(2.0f) &&
+       baseline.amp_2x > 0.001f)
+    {
+        float growth_2x =
+            features.order_amp_2x /
+            baseline.amp_2x;
+
+        /*
+           Debe crecer respecto al baseline
+           Y ser significativo respecto a 1X.
+        */
+
+        if(growth_2x >
+               LOOSENESS_2X_BASELINE_INCREASE &&
+           features.order_ratio_2x_1x >
+               LOOSENESS_2X_1X_RATIO)
+        {
+            harmonic_2x = true;
+            points += 2;
+        }
+    }
+
+
+    /*=========================================
+      3X
+    =========================================*/
+
+    if(order_is_observable(3.0f) &&
+       baseline.amp_3x > 0.001f)
+    {
+        float growth_3x =
+            features.order_amp_3x /
+            baseline.amp_3x;
+
+        /*
+           Igual que 2X:
+           crecimiento + importancia relativa.
+        */
+
+        if(growth_3x >
+               LOOSENESS_3X_BASELINE_INCREASE &&
+           features.order_ratio_3x_1x >
+               LOOSENESS_3X_1X_RATIO)
+        {
+            harmonic_3x = true;
+            points += 3;
+        }
+    }
+
+
+    /*=========================================
+      4X
+    =========================================*/
+
+    /*
+       Con Fs = 200 Hz y shaft ≈ 30 Hz:
+
+       4X ≈ 120 Hz > Nyquist
+
+       Normalmente no será observable,
+       pero conservamos la lógica para
+       futuras configuraciones.
+    */
+
+    if(order_is_observable(4.0f))
+    {
+        if(features.order_ratio_4x_1x >
+           LOOSENESS_4X_1X_RATIO)
+        {
+            harmonic_4x = true;
+            points += 2;
+        }
+    }
+
+
+    /*=========================================
+      Evidencia combinada
+    =========================================*/
+
+    if(harmonic_2x &&
+       harmonic_3x)
+    {
+        points += 3;
+    }
+
+    if(harmonic_3x &&
+       harmonic_4x)
+    {
+        points += 1;
+    }
+
+
+    return points;
+}
+
+static int eval_bearing(
+    float max_rms,
+    float max_peak,
+    float max_crest,
+    float max_kurtosis)
+{
+    int points = 0;
+
+
+    /*
+       Evitar interpretar ruido de reposo
+       como una falla de rodamiento.
+    */
+
+    if(max_rms < DIAG_MIN_RMS)
+        return 0;
+
+
+    if(max_crest > 5.5f)
+        points += 3;
+
+
+    if(max_kurtosis > 5.0f)
+        points += 3;
+
+
+    if(max_crest > 5.5f &&
+       max_kurtosis > 5.0f &&
+       max_peak > 0.10f)
+    {
+        points += 1;
+    }
+
+
+    return points;
+}
+
+static int eval_shock(
+    float max_peak,
+    float max_crest,
+    float max_kurtosis)
+{
+    int points = 0;
+
+
+    if(max_crest > 8.0f &&
+       max_kurtosis > 8.0f)
+    {
+        points += 8;
+
+
+        if(max_peak > 0.20f)
+            points += 2;
+    }
+
+
+    return points;
+}
+
+static bool machine_activity_detected(void)
+{
     float max_rms = features.rms[0];
-    float max_peak = features.peak[0];
-    float max_crest = features.crest[0];
-    float max_kurtosis = features.kurtosis[0];
 
     for(int i = 1; i < 3; i++)
     {
         if(features.rms[i] > max_rms)
+        {
             max_rms = features.rms[i];
+        }
+    }
+
+    bool rms_activity = max_rms > RUNNING_RMS_THRESHOLD;
+
+    bool rotation_activity = features.order_amp_1x > RUNNING_1X_THRESHOLD;
+    
+    return rms_activity && rotation_activity;
+}
+
+static void update_machine_run_state(void)
+{
+    static uint8_t running_counter = 0;
+    static uint8_t stopped_counter = 0;
+
+    bool activity =
+        machine_activity_detected();
+
+
+    /*=========================================
+      Actualmente STOPPED
+    =========================================*/
+
+    if(machine_run_state == MACHINE_STOPPED)
+    {
+        stopped_counter = 0;
+
+
+        if(activity)
+        {
+            if(running_counter <
+               RUNNING_CONFIRM_WINDOWS)
+            {
+                running_counter++;
+            }
+
+
+            if(running_counter >=
+               RUNNING_CONFIRM_WINDOWS)
+            {
+                machine_run_state =
+                    MACHINE_RUNNING;
+
+                running_counter = 0;
+
+
+                printf(
+                    "\n"
+                    "Machine operational state "
+                    "-> RUNNING\n"
+                );
+            }
+        }
+        else
+        {
+            /*
+               Las ventanas deben ser
+               consecutivas.
+            */
+
+            running_counter = 0;
+        }
+    }
+
+
+    /*=========================================
+      Actualmente RUNNING
+    =========================================*/
+
+    else
+    {
+        running_counter = 0;
+
+
+        if(!activity)
+        {
+            if(stopped_counter <
+               STOPPED_CONFIRM_WINDOWS)
+            {
+                stopped_counter++;
+            }
+
+
+            if(stopped_counter >=
+               STOPPED_CONFIRM_WINDOWS)
+            {
+                machine_run_state =
+                    MACHINE_STOPPED;
+
+                stopped_counter = 0;
+
+
+                printf(
+                    "\n"
+                    "Machine operational state "
+                    "-> STOPPED\n"
+                );
+            }
+        }
+        else
+        {
+            /*
+               Las ventanas sin actividad
+               deben ser consecutivas.
+            */
+
+            stopped_counter = 0;
+        }
+    }
+}
+
+static void diagnose_machine(void)
+{
+    /*=========================================
+      1. Obtener valores máximos
+    =========================================*/
+
+    float max_rms =
+        features.rms[0];
+
+    float max_peak =
+        features.peak[0];
+
+    float max_crest =
+        features.crest[0];
+
+    float max_kurtosis =
+        features.kurtosis[0];
+
+
+    for(int i = 1; i < 3; i++)
+    {
+        if(features.rms[i] > max_rms)
+            max_rms =
+                features.rms[i];
+
 
         if(features.peak[i] > max_peak)
-            max_peak = features.peak[i];
+            max_peak =
+                features.peak[i];
+
 
         if(features.crest[i] > max_crest)
-            max_crest = features.crest[i];
-
-        if(features.kurtosis[i] > max_kurtosis)
-            max_kurtosis = features.kurtosis[i];
-    }
-
-    /*----------------------------------------
-      Asignación de puntos
-    ----------------------------------------*/
-
-    /* Máquina normal */
-
-    if(max_rms < 0.020f)
-        score.normal += 2;
-
-    if(max_crest < 4.0f)
-        score.normal += 2;
-
-    if(max_kurtosis < 3.5f)
-        score.normal += 2;
+            max_crest =
+                features.crest[i];
 
 
-    /* Desbalance */
-
-    if(max_rms > 0.030f)
-        score.unbalance += 3;
-
-    if(max_crest < 5.0f)
-        score.unbalance += 1;
-
-    if(max_kurtosis < 4.0f)
-        score.unbalance += 1;
-
-    if(features.order_amp_1x >
-       features.order_amp_2x * 2.0f)
-    {
-        score.unbalance += 5;
+        if(features.kurtosis[i] >
+           max_kurtosis)
+        {
+            max_kurtosis =
+                features.kurtosis[i];
+        }
     }
 
 
-    /* Desalineación */
+    /*=========================================
+      2. Evaluar cada estado
+    =========================================*/
 
-    if(max_rms > 0.020f)
-        score.misalignment += 1;
-
-    if(features.order_ratio_2x_1x > 0.5f)
-    {
-        score.misalignment += 5;
-    }
-
-
-    /* Holgura */
-    if(features.order_ratio_3x_1x > 0.30f)
-    {
-        score.looseness += 3;
-    }
-
-    if(features.order_ratio_4x_1x > 0.30f)
-    {
-        score.looseness += 3;
-    }
+    score.normal =
+        eval_normal(
+            max_rms,
+            max_peak,
+            max_crest,
+            max_kurtosis
+        );
 
 
-    /* Rodamiento */
-
-    if(max_crest > 5.5f)
-        score.bearing += 3;
-
-    if(max_kurtosis > 5.0f)
-        score.bearing += 3;
-
-    if(max_peak > 0.04f)
-        score.bearing += 1;
+    score.unbalance =
+        eval_unbalance(
+            max_rms,
+            max_peak,
+            max_crest,
+            max_kurtosis
+        );
 
 
-    /* Impacto */
+    score.misalignment =
+        eval_misalignment(
+            max_rms
+        );
 
-    if(max_crest > 8.0f)
-        score.shock += 4;
 
-    if(max_kurtosis > 8.0f)
-        score.shock += 4;
+    score.looseness =
+        eval_looseness(
+            max_rms
+        );
 
-    if(max_peak > 0.10f)
-        score.shock += 2;
 
-    /*----------------------------------------
-      Buscar el diagnóstico con mayor puntaje
-    ----------------------------------------*/
+    score.bearing =
+        eval_bearing(
+            max_rms,
+            max_peak,
+            max_crest,
+            max_kurtosis
+        );
 
-    int best_score = score.normal;
-    detected_state = MACHINE_NORMAL;
+
+    score.shock =
+        eval_shock(
+            max_peak,
+            max_crest,
+            max_kurtosis
+        );
+
+
+    /*=========================================
+      3. Seleccionar mejor diagnóstico
+    =========================================*/
+
+    int best_score =
+        score.normal;
+
+    detected_state =
+        MACHINE_NORMAL;
+
 
     if(score.unbalance > best_score)
     {
-        best_score = score.unbalance;
-        detected_state = MACHINE_UNBALANCE;
+        best_score =
+            score.unbalance;
+
+        detected_state =
+            MACHINE_UNBALANCE;
     }
+
 
     if(score.misalignment > best_score)
     {
-        best_score = score.misalignment;
-        detected_state = MACHINE_MISALINGMENT;
+        best_score =
+            score.misalignment;
+
+        detected_state =
+            MACHINE_MISALINGMENT;
     }
+
 
     if(score.looseness > best_score)
     {
-        best_score = score.looseness;
-        detected_state = MACHINE_LOOSENESS;
+        best_score =
+            score.looseness;
+
+        detected_state =
+            MACHINE_LOOSENESS;
     }
+
 
     if(score.bearing > best_score)
     {
-        best_score = score.bearing;
-        detected_state = MACHINE_BEARING_DAMAGE;
+        best_score =
+            score.bearing;
+
+        detected_state =
+            MACHINE_BEARING_DAMAGE;
     }
+
 
     if(score.shock > best_score)
     {
-        best_score = score.shock;
-        detected_state = MACHINE_SHOCK;
+        best_score =
+            score.shock;
+
+        detected_state =
+            MACHINE_SHOCK;
     }
 
+
     /*=========================================
-      Guardar resultados
+      4. Guardar puntuaciones
     =========================================*/
 
-    features.score_normal       = score.normal;
-    features.score_unbalance    = score.unbalance;
-    features.score_misalignment = score.misalignment;
-    features.score_looseness    = score.looseness;
-    features.score_bearing      = score.bearing;
-    features.score_shock        = score.shock;
+    features.score_normal =
+        score.normal;
+
+    features.score_unbalance =
+        score.unbalance;
+
+    features.score_misalignment =
+        score.misalignment;
+
+    features.score_looseness =
+        score.looseness;
+
+    features.score_bearing =
+        score.bearing;
+
+    features.score_shock =
+        score.shock;
+
+
+    /*=========================================
+      5. Confianza relativa
+    =========================================*/
 
     int total =
         score.normal +
@@ -933,58 +1988,116 @@ static void diagnose_machine(void)
         score.bearing +
         score.shock;
 
+
     if(total > 0)
+    {
         features.diagnosis_confidence =
-            (100.0f * best_score) / total;
-    else
-        features.diagnosis_confidence = 0.0f;
-
-    /*----------------------------------------
-      Histéresis temporal
-    ----------------------------------------*/
-
-    if(detected_state != candidate_state)
-    {
-        candidate_state = detected_state;
-        candidate_counter = 1;
+            (100.0f * best_score) /
+            total;
     }
     else
     {
-        if(candidate_counter < 3)
-            candidate_counter++;
+        features.diagnosis_confidence =
+            0.0f;
     }
 
-    if(candidate_counter >= 3)
+
+    /*=========================================
+      6. Histéresis temporal
+    =========================================*/
+
+    /*
+       SHOCK es instantáneo:
+       no esperar tres ventanas.
+    */
+
+    if(detected_state ==
+       MACHINE_SHOCK)
     {
-        current_state = candidate_state;
+        current_state =
+            MACHINE_SHOCK;
+
+        candidate_state =
+            MACHINE_SHOCK;
+
+        candidate_counter = 3;
+    }
+    else
+    {
+        if(detected_state !=
+           candidate_state)
+        {
+            candidate_state =
+                detected_state;
+
+            candidate_counter = 1;
+        }
+        else
+        {
+            if(candidate_counter < 3)
+                candidate_counter++;
+        }
+
+
+        if(candidate_counter >= 3)
+        {
+            current_state =
+                candidate_state;
+        }
     }
 
-    machine_state = current_state;
 
-    /*----------------------------------------
-      Nivel de alarma
-    ----------------------------------------*/
+    machine_state =
+        current_state;
+
+
+    /*=========================================
+      7. Nivel de alarma
+    =========================================*/
 
     switch(machine_state)
     {
         case MACHINE_NORMAL:
-            alarm_level = LEVEL_NORMAL;
+
+            alarm_level =
+                LEVEL_NORMAL;
+
             break;
+
 
         case MACHINE_UNBALANCE:
-            alarm_level = LEVEL_WARNING;
+
+        case MACHINE_MISALINGMENT:
+
+        case MACHINE_LOOSENESS:
+
+            alarm_level =
+                LEVEL_WARNING;
+
             break;
+
 
         case MACHINE_BEARING_DAMAGE:
-            alarm_level = LEVEL_ALARM;
+
+            alarm_level =
+                LEVEL_ALARM;
+
             break;
+
 
         case MACHINE_SHOCK:
-            alarm_level = LEVEL_CRITICAL;
+
+            alarm_level =
+                LEVEL_CRITICAL;
+
             break;
 
+
         default:
-            alarm_level = LEVEL_WARNING;
+
+            alarm_level =
+                LEVEL_WARNING;
+
             break;
     }
 }
@@ -1098,13 +2211,96 @@ void task_processing(void *pvParameters)
 
             /* Diagnostico */
             case DSP_DIAGNOSIS:
-
-            diagnose_machine();
-            dsp_state = DSP_FINISH;
-            break;
+            {
+                /*
+                Actividad correspondiente exclusivamente a la ventana actual.*/
+                
+                bool activity = machine_activity_detected();
+                
+                /* Actualizar estado confirmado STOPPED / RUNNING*/
+                
+                update_machine_run_state();
+                
+                /*=========================================
+                Máquina sin actividad en esta ventana
+                =========================================*/
+                
+                if(!activity)
+                {
+                    
+                    /*
+                    Si estábamos aprendiendo baseline
+                    y la máquina se detuvo, descartar
+                    aprendizaje incompleto.
+                    */
+                   
+                    if(!baseline.valid)
+                    {
+                        reset_baseline_learning();
+                    }
+                    
+                    score.normal = 0;
+                    score.unbalance = 0;
+                    score.misalignment = 0;
+                    score.looseness = 0;
+                    score.bearing = 0;
+                    score.shock = 0;
+                    
+                    features.score_normal = 0;
+                    features.score_unbalance = 0;
+                    features.score_misalignment = 0;
+                    features.score_looseness = 0;
+                    features.score_bearing = 0;
+                    features.score_shock = 0;
+                    features.diagnosis_confidence = 0.0f;
+                    
+                    dsp_state = DSP_FINISH;
+                    break;
+                }
+                
+                /*=========================================
+                Todavía no está RUNNING confirmado
+                =========================================*/
+                
+                if(machine_run_state != MACHINE_RUNNING)
+                {
+                    /*
+                    Hay actividad, pero todavía estamos confirmando el arranque.*/
+                    dsp_state = DSP_FINISH;
+                    break;
+                }
+                
+                /*=========================================
+                RUNNING pero sin baseline
+                =========================================*/
+                
+                if(!baseline.valid)
+                {
+                    update_baseline();
+                    
+                    dsp_state = DSP_FINISH;
+                    break;
+                }
+                
+                /*=========================================
+                RUNNING + baseline válido
+                =========================================*/
+                
+                diagnose_machine();
+                
+                dsp_state = DSP_FINISH;
+                break;
+            }
 
             /* Caso Finish */
             case DSP_FINISH:
+
+            telemetry.machine_state = machine_state;
+            telemetry.alarm_level = alarm_level;
+            telemetry.features = features;
+            telemetry.timestamp = features.timestamp;
+            
+            modbus_update_features(&telemetry);
             
             processing_finished = true;
             proceesing_busy = false;
@@ -1125,103 +2321,402 @@ void task_debug(void *pvParameters)
         if(processing_finished)
         {
             processing_finished = false;
-            
+
             printf("\n");
             printf("============================================================\n");
             printf("               SMMR v3.0 - DIAGNOSTIC REPORT\n");
             printf("============================================================\n");
-            
-            printf("Machine State : %s\n", state_to_string(machine_state));
-            printf("Alarm Level   : %s\n", alarm_to_string(alarm_level));
-            printf("Confidence    : %.1f %%\n", features.diagnosis_confidence);
-            printf("Timestamp     : %llu us\n", features.timestamp);
-            
+
+
+            /*=========================================
+              Estado operativo
+            =========================================*/
+
+            printf(
+                "Operational   : %s\n",
+                machine_run_state == MACHINE_RUNNING ?
+                "RUNNING" :
+                "STOPPED"
+            );
+
+
+            /*=========================================
+              Estado del baseline / diagnóstico
+            =========================================*/
+
+            if(machine_run_state == MACHINE_STOPPED)
+            {
+                printf(
+                    "Machine State : NOT DIAGNOSED\n"
+                );
+
+                printf(
+                    "Baseline      : %s\n",
+                    baseline.valid ?
+                    "VALID" :
+                    "NOT AVAILABLE"
+                );
+
+                printf(
+                    "Alarm Level   : INACTIVE\n"
+                );
+
+                printf(
+                    "Confidence    : --\n"
+                );
+            }
+            else if(!baseline.valid)
+            {
+                printf(
+                    "Machine State : BASELINE LEARNING\n"
+                );
+
+                /*
+                   Antes de comenzar la adquisición
+                   se ejecutan las ventanas de
+                   estabilización.
+                */
+
+                if(baseline_stability_counter <
+                   BASELINE_STABILIZATION_WINDOWS)
+                {
+                    printf(
+                        "Baseline      : STABILIZING (%u/%u)\n",
+                        baseline_stability_counter,
+                        BASELINE_STABILIZATION_WINDOWS
+                    );
+                }
+                else
+                {
+                    printf(
+                        "Baseline      : LEARNING (%u/%u)\n",
+                        baseline_accumulator.count,
+                        BASELINE_WINDOWS
+                    );
+                }
+
+                printf(
+                    "Alarm Level   : INACTIVE\n"
+                );
+
+                printf(
+                    "Confidence    : --\n"
+                );
+            }
+            else
+            {
+                printf(
+                    "Machine State : %s\n",
+                    state_to_string(machine_state)
+                );
+
+                printf(
+                    "Baseline      : VALID\n"
+                );
+
+                printf(
+                    "Alarm Level   : %s\n",
+                    alarm_to_string(alarm_level)
+                );
+
+                printf(
+                    "Confidence    : %.1f %%\n",
+                    features.diagnosis_confidence
+                );
+            }
+
+
+            printf(
+                "Timestamp     : %llu us\n",
+                features.timestamp
+            );
+
+
+            /*=========================================
+              RMS
+            =========================================*/
+
             printf("\n");
             printf("---------------- RMS (m/s²) ----------------\n");
-            printf("X: %.5f   Y: %.5f   Z: %.5f\n",
+
+            printf(
+                "X: %.5f   Y: %.5f   Z: %.5f\n",
                 features.rms[0],
                 features.rms[1],
-                features.rms[2]);
-                
+                features.rms[2]
+            );
+
+
+            /*=========================================
+              Peak
+            =========================================*/
+
             printf("\n");
             printf("---------------- Peak (m/s²) ---------------\n");
-            printf("X: %.5f   Y: %.5f   Z: %.5f\n",
+
+            printf(
+                "X: %.5f   Y: %.5f   Z: %.5f\n",
                 features.peak[0],
                 features.peak[1],
-                features.peak[2]);
-                
+                features.peak[2]
+            );
+
+
+            /*=========================================
+              Crest Factor
+            =========================================*/
+
             printf("\n");
             printf("--------------- Crest Factor ---------------\n");
-            printf("X: %.2f    Y: %.2f    Z: %.2f\n",
+
+            printf(
+                "X: %.2f    Y: %.2f    Z: %.2f\n",
                 features.crest[0],
                 features.crest[1],
-                features.crest[2]);
-                
+                features.crest[2]
+            );
+
+
+            /*=========================================
+              Kurtosis
+            =========================================*/
+
             printf("\n");
             printf("---------------- Kurtosis ------------------\n");
-            printf("X: %.2f    Y: %.2f    Z: %.2f\n",
+
+            printf(
+                "X: %.2f    Y: %.2f    Z: %.2f\n",
                 features.kurtosis[0],
                 features.kurtosis[1],
-                features.kurtosis[2]);
-                
+                features.kurtosis[2]
+            );
+
+
+            /*=========================================
+              Frecuencia dominante
+            =========================================*/
+
             printf("\n");
             printf("------------ Dominant Frequency ------------\n");
-            printf("Axis       : %c\n", 'X' + features.dominant_axis);
-            printf("Frequency  : %.2f Hz\n", features.dominant_freq);
-            printf("Amplitude  : %.3f\n", features.dominant_amp);
-            printf("Order      : %.2fX\n", features.dominant_order);
+
+            printf(
+                "Axis       : %c\n",
+                'X' + features.dominant_axis
+            );
+
+            printf(
+                "Frequency  : %.2f Hz\n",
+                features.dominant_freq
+            );
+
+            printf(
+                "Amplitude  : %.3f\n",
+                features.dominant_amp
+            );
+
+            printf(
+                "Order      : %.2fX\n",
+                features.dominant_order
+            );
+
+
+            /*=========================================
+              Order Tracking
+            =========================================*/
+
             printf("\n");
-            
             printf("-------------- Order Tracking --------------\n");
-            printf("1X : %.3f\n", features.order_amp_1x);
-            printf("2X : %.3f   (%.2f)\n",
+
+            printf(
+                "1X : %.3f\n",
+                features.order_amp_1x
+            );
+
+            printf(
+                "2X : %.3f   (%.2f)\n",
                 features.order_amp_2x,
-                features.order_ratio_2x_1x);
-                
-            printf("3X : %.3f   (%.2f)\n",
+                features.order_ratio_2x_1x
+            );
+
+            printf(
+                "3X : %.3f   (%.2f)\n",
                 features.order_amp_3x,
-                features.order_ratio_3x_1x);
-                
-            printf("4X : %.3f   (%.2f)\n",
+                features.order_ratio_3x_1x
+            );
+
+            printf(
+                "4X : %.3f   (%.2f)\n",
                 features.order_amp_4x,
-                features.order_ratio_4x_1x);
-                
+                features.order_ratio_4x_1x
+            );
+
+
+            /*=========================================
+              FFT Peaks
+            =========================================*/
+
             printf("\n");
             printf("---------------- FFT Peaks -----------------\n");
-            
+
             for(int axis = 0; axis < 3; axis++)
             {
-                printf("%c : ", 'X' + axis);
-                
-                for(int i = 0; i < FFT_TOP_PEAKS; i++)
+                printf(
+                    "%c : ",
+                    'X' + axis
+                );
+
+                for(int i = 0;
+                    i < FFT_TOP_PEAKS;
+                    i++)
                 {
-                    printf("[%.2f Hz | %.3f] ",
+                    printf(
+                        "[%.2f Hz | %.3f] ",
                         features.fft_freq[axis][i],
-                        features.fft_amp[axis][i]);
+                        features.fft_amp[axis][i]
+                    );
                 }
 
                 printf("\n");
             }
-            
+
+
+            /*=========================================
+              Baseline
+            =========================================*/
+
+            printf("\n");
+            printf("---------------- Baseline ------------------\n");
+
+            if(baseline.valid)
+            {
+                printf(
+                    "RMS  : X=%.5f Y=%.5f Z=%.5f\n",
+                    baseline.rms[0],
+                    baseline.rms[1],
+                    baseline.rms[2]
+                );
+
+                printf(
+                    "Peak : X=%.5f Y=%.5f Z=%.5f\n",
+                    baseline.peak[0],
+                    baseline.peak[1],
+                    baseline.peak[2]
+                );
+
+                printf(
+                    "1X   : %.3f\n",
+                    baseline.amp_1x
+                );
+
+                printf(
+                    "2X   : %.3f\n",
+                    baseline.amp_2x
+                );
+
+                printf(
+                    "3X   : %.3f\n",
+                    baseline.amp_3x
+                );
+            }
+            else if(machine_run_state == MACHINE_RUNNING)
+            {
+                if(baseline_stability_counter <
+                   BASELINE_STABILIZATION_WINDOWS)
+                {
+                    printf(
+                        "Status : STABILIZING (%u/%u)\n",
+                        baseline_stability_counter,
+                        BASELINE_STABILIZATION_WINDOWS
+                    );
+                }
+                else
+                {
+                    printf(
+                        "Status : LEARNING (%u/%u)\n",
+                        baseline_accumulator.count,
+                        BASELINE_WINDOWS
+                    );
+                }
+            }
+            else
+            {
+                printf(
+                    "Status : WAITING FOR MACHINE START\n"
+                );
+            }
+
+
+            /*=========================================
+              Diagnosis Score
+            =========================================*/
+
             printf("\n");
             printf("------------- Diagnosis Score --------------\n");
-            
-            printf("Normal       : %2d\n", features.score_normal);
-            printf("Unbalance    : %2d\n", features.score_unbalance);
-            printf("Misalignment : %2d\n", features.score_misalignment);
-            printf("Looseness    : %2d\n", features.score_looseness);
-            printf("Bearing      : %2d\n", features.score_bearing);
-            printf("Shock        : %2d\n", features.score_shock);
-            printf("============================================================\n");
+
+
+            if(machine_run_state == MACHINE_STOPPED)
+            {
+                printf(
+                    "Diagnosis disabled - machine STOPPED\n"
+                );
+            }
+            else if(!baseline.valid)
+            {
+                printf(
+                    "Diagnosis disabled - learning baseline\n"
+                );
+            }
+            else
+            {
+                printf(
+                    "Normal       : %2d\n",
+                    features.score_normal
+                );
+
+                printf(
+                    "Unbalance    : %2d\n",
+                    features.score_unbalance
+                );
+
+                printf(
+                    "Misalignment : %2d\n",
+                    features.score_misalignment
+                );
+
+                printf(
+                    "Looseness    : %2d\n",
+                    features.score_looseness
+                );
+
+                printf(
+                    "Bearing      : %2d\n",
+                    features.score_bearing
+                );
+
+                printf(
+                    "Shock        : %2d\n",
+                    features.score_shock
+                );
+            }
+
+
+            printf(
+                "============================================================\n"
+            );
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+
+        vTaskDelay(
+            pdMS_TO_TICKS(100)
+        );
     }
 }
 
 /* Aplicación principal */
 void app_main(void)
 {
+    //ESP_LOGI(TAG, "Iniciando SMMR v3.0");
+
     esp_err_t ret;
 
     printf("\n");
